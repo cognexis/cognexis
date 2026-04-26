@@ -1,0 +1,90 @@
+---
+
+# Dust Open Source License v1.0
+
+## Intelligence Infrastructure Edition (DOSL-IIE-1.0)
+
+Copyright (c) 2026 Dust LLC, and Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+---
+
+## 1. Attribution
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+---
+
+## 2. Intelligence Asset Independence
+
+The Software is infrastructure software and does not claim ownership over any Intelligence Assets.
+
+For purposes of this License, “Intelligence Assets” include, but are not limited to:
+
+* machine learning models
+* neural network weights and parameters
+* model shards
+* embeddings
+* training data
+* inference outputs
+* fine-tuned derivatives
+* or any learned computational artifacts
+
+Intelligence Assets are NOT covered by this License unless explicitly licensed under it by their owner.
+
+Use of the Software to create, store, execute, host, distribute, or operate Intelligence Assets does NOT:
+
+* transfer ownership of Intelligence Assets,
+* impose this License on Intelligence Assets, or
+* grant any rights over Intelligence Assets to the Software authors or contributors.
+
+Ownership and licensing of Intelligence Assets remain solely with their respective owners.
+
+---
+
+## 3. Sovereign Network Rights
+
+You may use the Software to deploy, operate, modify, and run independent or commercial networks, protocols, or infrastructure.
+
+This License does not restrict:
+
+* commercial use
+* protocol deployment
+* network monetization
+* protocol modification
+* or sovereign infrastructure operation
+
+---
+
+## 4. Patent Grant
+
+Each Contributor grants You a perpetual, worldwide, non-exclusive, royalty-free license under any patent claims owned or controlled by the Contributor that are necessarily infringed by their contributions.
+
+If You initiate patent litigation claiming that the Software infringes a patent, this patent license terminates immediately.
+
+---
+
+## 5. No Trademark License
+
+This License does not grant permission to use any trademarks, service marks, or trade names of the Licensor, except as required for reasonable and customary attribution.
+
+---
+
+## 6. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+---
+
+## 7. Limitation of Liability
+
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT, OR OTHERWISE, ARISING FROM OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+## SPDX Identifier
+
+DOSL-IIE-1.0
+
+---
