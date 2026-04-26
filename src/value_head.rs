@@ -19,9 +19,16 @@ impl ValueHead {
         }
     }
 
-    /// Predict a scalar value for each token position. This stub
-    /// returns zeros.
+    /// Predict a deterministic scalar confidence proxy for each token position.
     pub fn forward(&self, x: &[Vec<f32>]) -> Vec<f32> {
-        vec![0.0; x.len()]
+        x.iter()
+            .map(|row| {
+                if row.is_empty() {
+                    return 0.0;
+                }
+                let mean_abs = row.iter().map(|value| value.abs()).sum::<f32>() / row.len() as f32;
+                mean_abs / (1.0 + mean_abs)
+            })
+            .collect()
     }
 }

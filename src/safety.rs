@@ -14,16 +14,35 @@ pub enum SafetyIssue {
     Other,
 }
 
-/// Placeholder function to check a generated text for safety
-/// violations. In a full implementation this would use classifiers or
-/// pattern matching.
-pub fn check_safety(_generated: &str) -> Option<SafetyIssue> {
-    // TODO: Implement safety checking.
+/// Lightweight reference safety checks. Production deployments should
+/// replace this with policy-specific classifiers and audit logging.
+pub fn check_safety(generated: &str) -> Option<SafetyIssue> {
+    let lower = generated.to_lowercase();
+    if ["api_key", "password:", "secret_key", "ssn:"]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return Some(SafetyIssue::SensitiveInformation);
+    }
+    if ["kill yourself", "racial slur", "terrorist manifesto"]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return Some(SafetyIssue::OffensiveLanguage);
+    }
+    if ["vaccines always cause autism", "the earth is flat"]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return Some(SafetyIssue::Misinformation);
+    }
     None
 }
 
 /// Log events or metrics during training and inference. In practice
 /// this might send data to a monitoring system.
-pub fn log_event(_event: &str) {
-    // TODO: Implement logging.
+pub fn log_event(event: &str) {
+    if !event.trim().is_empty() {
+        eprintln!("[cognexis] {event}");
+    }
 }

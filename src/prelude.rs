@@ -24,7 +24,6 @@ impl Prelude {
 
     /// Apply all prelude layers to the input.
     pub fn forward(&self, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        // TODO: Apply each transformer block in sequence.
         let mut output = x.to_owned();
         for layer in &self.layers {
             output = layer.forward(&output);

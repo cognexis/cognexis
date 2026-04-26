@@ -19,8 +19,29 @@ impl TokenwiseSchedule {
             loops_per_token: vec![loops; seq_len],
         }
     }
+
+    /// Create a schedule while clamping every token to configured bounds.
+    pub fn bounded(loops_per_token: Vec<usize>, min_loops: usize, max_loops: usize) -> Self {
+        let upper = max_loops.max(min_loops);
+        Self {
+            loops_per_token: loops_per_token
+                .into_iter()
+                .map(|loops| loops.clamp(min_loops, upper))
+                .collect(),
+        }
+    }
+
     /// Get the number of loops for a specific token index.
     pub fn loops_for(&self, index: usize) -> usize {
         *self.loops_per_token.get(index).unwrap_or(&1)
+    }
+
+    /// Return a mask indicating which tokens are still active at a
+    /// zero-based loop index.
+    pub fn active_mask_for_loop(&self, loop_index: usize) -> Vec<bool> {
+        self.loops_per_token
+            .iter()
+            .map(|loops| loop_index < *loops)
+            .collect()
     }
 }

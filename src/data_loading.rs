@@ -7,6 +7,7 @@
 //! streaming large datasets.
 
 /// A single training example consisting of input and target token IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingExample {
     pub input_ids: Vec<u32>,
     pub target_ids: Vec<u32>,
@@ -26,7 +27,7 @@ impl DataLoader {
     pub fn new(examples: Vec<TrainingExample>, batch_size: usize) -> Self {
         Self {
             examples,
-            batch_size,
+            batch_size: batch_size.max(1),
             position: 0,
         }
     }
@@ -41,5 +42,10 @@ impl DataLoader {
         let batch = self.examples[self.position..end].to_vec();
         self.position = end;
         Some(batch)
+    }
+
+    /// Reset iteration back to the first example.
+    pub fn reset(&mut self) {
+        self.position = 0;
     }
 }
