@@ -74,6 +74,53 @@ impl Default for DecodeOptions {
     }
 }
 
+/// Incremental decoder that preserves UTF-8 boundaries for streaming.
+#[derive(Debug, Clone)]
+pub struct StreamingDecoder {
+    tokenizer: Tokenizer,
+    options: DecodeOptions,
+    byte_buffer: Vec<u8>,
+    stopped: bool,
+}
+
+impl StreamingDecoder {
+    /// Decode one token and return only newly completed text.
+    pub fn push(&mut self, token_id: TokenId) -> Result<String> {
+        if self.stopped {
+            return Ok(String::new());
+        }
+        if token_id == EOS_ID && self.options.stop_at_eos {
+            self.stopped = true;
+            return Ok(self.finish());
+        }
+        if token_id == PAD_ID && self.options.skip_padding {
+            return Ok(String::new());
+        }
+        if let Some(byte) = byte_from_token_id(token_id) {
+            self.byte_buffer.push(byte);
+            return Ok(flush_complete_utf8(&mut self.byte_buffer));
+        }
+
+        let mut output = self.finish();
+        match self.tokenizer.id_to_token.get(&token_id) {
+            Some(token) if self.options.show_special => output.push_str(token),
+            Some(_) => {}
+            None => return Err(CognexisError::InvalidTokenId(token_id)),
+        }
+        Ok(output)
+    }
+
+    /// Flush pending bytes at the end of a stream.
+    pub fn finish(&mut self) -> String {
+        if self.byte_buffer.is_empty() {
+            return String::new();
+        }
+        let output = String::from_utf8_lossy(&self.byte_buffer).into_owned();
+        self.byte_buffer.clear();
+        output
+    }
+}
+
 /// Structure representing a tokenizer.
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
@@ -238,6 +285,16 @@ impl Tokenizer {
         Ok(output)
     }
 
+    /// Create an incremental decoder for streaming generation.
+    pub fn streaming_decoder(&self, options: DecodeOptions) -> StreamingDecoder {
+        StreamingDecoder {
+            tokenizer: self.clone(),
+            options,
+            byte_buffer: Vec::new(),
+            stopped: false,
+        }
+    }
+
     fn special_tokens_by_length(&self) -> Vec<(String, TokenId)> {
         let mut tokens: Vec<_> = self
             .token_to_id
@@ -265,6 +322,50 @@ fn flush_bytes(output: &mut String, byte_buffer: &mut Vec<u8>) {
         output.push_str(&String::from_utf8_lossy(byte_buffer));
         byte_buffer.clear();
     }
+}
+
+fn flush_complete_utf8(byte_buffer: &mut Vec<u8>) -> String {
+    let mut output = String::new();
+
+    loop {
+        if byte_buffer.is_empty() {
+            break;
+        }
+
+        match std::str::from_utf8(byte_buffer) {
+            Ok(text) => {
+                output.push_str(text);
+                byte_buffer.clear();
+                break;
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to == 0 {
+                    break;
+                }
+                output.push_str(
+                    std::str::from_utf8(&byte_buffer[..valid_up_to])
+                        .expect("valid_up_to marks a valid UTF-8 prefix"),
+                );
+                byte_buffer.drain(..valid_up_to);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    output.push_str(
+                        std::str::from_utf8(&byte_buffer[..valid_up_to])
+                            .expect("valid_up_to marks a valid UTF-8 prefix"),
+                    );
+                }
+                let bad_len = error.error_len().unwrap_or(1);
+                output.push('\u{FFFD}');
+                byte_buffer.drain(..valid_up_to + bad_len);
+            }
+        }
+    }
+
+    output
 }
 
 fn apply_truncation(

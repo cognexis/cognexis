@@ -6,6 +6,8 @@
 //! `serde` to allow loading from JSON or other formats.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
 use crate::{CognexisError, Result};
 
@@ -152,6 +154,70 @@ impl ModelConfig {
     }
 }
 
+/// Serving configuration used when constructing a model from a checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeConfig {
+    #[serde(default)]
+    pub model: ModelConfig,
+    #[serde(default = "default_max_sequence_length")]
+    pub max_sequence_length: usize,
+    #[serde(default = "default_max_new_tokens")]
+    pub max_new_tokens: usize,
+    #[serde(default)]
+    pub max_user_loops: Option<usize>,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            model: ModelConfig::default(),
+            max_sequence_length: default_max_sequence_length(),
+            max_new_tokens: default_max_new_tokens(),
+            max_user_loops: None,
+        }
+    }
+}
+
+impl ServeConfig {
+    /// Load a serving config from JSON. If the file contains only a
+    /// model config, it is accepted and wrapped in serving defaults.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let contents = fs::read_to_string(path.as_ref()).map_err(|error| {
+            CognexisError::Backend(format!(
+                "failed to read serve config {}: {error}",
+                path.as_ref().display()
+            ))
+        })?;
+
+        serde_json::from_str::<ServeConfig>(&contents)
+            .or_else(|_| {
+                serde_json::from_str::<ModelConfig>(&contents).map(|model| ServeConfig {
+                    model,
+                    ..ServeConfig::default()
+                })
+            })
+            .map_err(|error| CognexisError::InvalidConfig(format!("invalid serve config: {error}")))
+    }
+
+    /// Validate serving and architecture limits together.
+    pub fn validate(&self) -> Result<()> {
+        self.model.validate()?;
+        if self.max_sequence_length == 0 {
+            return Err(CognexisError::InvalidConfig(
+                "max_sequence_length must be positive".to_string(),
+            ));
+        }
+        if let Some(max_user_loops) = self.max_user_loops {
+            if max_user_loops == 0 {
+                return Err(CognexisError::InvalidConfig(
+                    "max_user_loops must be positive when set".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 const fn default_min_loop_count() -> usize {
     1
 }
@@ -174,4 +240,12 @@ const fn default_tie_embeddings() -> bool {
 
 const fn default_embedding_scale() -> f32 {
     1.0
+}
+
+const fn default_max_sequence_length() -> usize {
+    8_192
+}
+
+const fn default_max_new_tokens() -> usize {
+    512
 }

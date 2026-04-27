@@ -6,7 +6,7 @@
 //! `spec24_safety_monitoring.md` for recommended practices.
 
 /// Enumeration of possible safety concerns detected during inference.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyIssue {
     OffensiveLanguage,
     SensitiveInformation,

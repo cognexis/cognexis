@@ -20,6 +20,7 @@ pub mod feedforward;
 pub mod instruction_tuning;
 pub mod lm_head;
 pub mod loop_scaling;
+pub mod model;
 pub mod prefill_decode;
 pub mod prelude;
 pub mod recurrent_core;
@@ -31,4 +32,9 @@ pub mod tokenwise;
 pub mod transformer_block;
 pub mod value_head;
 
+pub use config::ServeConfig;
 pub use error::{CognexisError, Result};
+pub use model::{
+    CognexisModel, GenerationRequest, GenerationStepOutput, LoopMode, LoopOptions, SamplingOptions,
+    StopReason,
+};
