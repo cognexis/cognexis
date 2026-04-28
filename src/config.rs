@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use crate::tokenizer::TokenizerManifest;
 use crate::{CognexisError, Result};
 
 /// Global configuration for the Cognexis model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelConfig {
     /// Size of the vocabulary (number of tokens).
     pub vocab_size: usize,
@@ -155,7 +156,305 @@ impl ModelConfig {
 }
 
 /// Serving configuration used when constructing a model from a checkpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Top-level resolved Cognexis configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CognexisConfig {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub run: RunConfig,
+    #[serde(default = "TokenizerManifest::reference")]
+    pub tokenizer: TokenizerManifest,
+    #[serde(default)]
+    pub model: ModelConfig,
+    #[serde(default)]
+    pub training: Option<TrainingConfig>,
+    #[serde(default)]
+    pub inference: Option<InferenceConfig>,
+    #[serde(default)]
+    pub evaluation: Option<EvaluationConfig>,
+    #[serde(default)]
+    pub safety: Option<SafetyConfig>,
+    #[serde(default)]
+    pub logging: Option<LoggingConfig>,
+}
+
+impl Default for CognexisConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: default_schema_version(),
+            run: RunConfig::default(),
+            tokenizer: TokenizerManifest::reference(),
+            model: ModelConfig::default(),
+            training: None,
+            inference: Some(InferenceConfig::default()),
+            evaluation: None,
+            safety: Some(SafetyConfig::default()),
+            logging: Some(LoggingConfig::default()),
+        }
+    }
+}
+
+impl CognexisConfig {
+    /// Load a top-level config from JSON.
+    pub fn load_json(path: impl AsRef<Path>) -> Result<Self> {
+        let contents = fs::read_to_string(path.as_ref()).map_err(|error| {
+            CognexisError::Backend(format!(
+                "failed to read config {}: {error}",
+                path.as_ref().display()
+            ))
+        })?;
+        let config = serde_json::from_str::<Self>(&contents).map_err(|error| {
+            CognexisError::InvalidConfig(format!("invalid config JSON: {error}"))
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Serialize the fully resolved config as pretty JSON.
+    pub fn resolved_json(&self) -> Result<String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).map_err(|error| {
+            CognexisError::Backend(format!("config serialization failed: {error}"))
+        })
+    }
+
+    /// Validate top-level and cross-section invariants.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != default_schema_version() {
+            return Err(CognexisError::InvalidConfig(format!(
+                "unsupported schema_version {}",
+                self.schema_version
+            )));
+        }
+        self.run.validate()?;
+        self.tokenizer
+            .validate()
+            .map_err(|error| CognexisError::InvalidConfig(error.to_string()))?;
+        self.model.validate()?;
+        if self.tokenizer.vocab_size != self.model.vocab_size {
+            return Err(CognexisError::InvalidConfig(format!(
+                "tokenizer vocab_size ({}) must match model vocab_size ({})",
+                self.tokenizer.vocab_size, self.model.vocab_size
+            )));
+        }
+        if let Some(training) = &self.training {
+            training.validate()?;
+        }
+        if let Some(inference) = &self.inference {
+            inference.validate(&self.model)?;
+        }
+        if let Some(evaluation) = &self.evaluation {
+            evaluation.validate()?;
+        }
+        if let Some(safety) = &self.safety {
+            safety.validate(&self.model)?;
+        }
+        Ok(())
+    }
+}
+
+/// Run metadata recorded in resolved configs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunConfig {
+    #[serde(default = "default_run_name")]
+    pub name: String,
+    #[serde(default)]
+    pub seed: u64,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            name: default_run_name(),
+            seed: 0,
+        }
+    }
+}
+
+impl RunConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(CognexisError::InvalidConfig(
+                "run.name must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Data-related training config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrainingConfig {
+    pub train_manifest: Option<String>,
+    pub validation_manifest: Option<String>,
+    #[serde(default = "default_sequence_length")]
+    pub sequence_length: usize,
+    #[serde(default = "default_true")]
+    pub packing: bool,
+    #[serde(default)]
+    pub document_boundary_attention: bool,
+}
+
+impl Default for TrainingConfig {
+    fn default() -> Self {
+        Self {
+            train_manifest: None,
+            validation_manifest: None,
+            sequence_length: default_sequence_length(),
+            packing: true,
+            document_boundary_attention: false,
+        }
+    }
+}
+
+impl TrainingConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.sequence_length < 2 {
+            return Err(CognexisError::InvalidConfig(
+                "training.sequence_length must be at least 2".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Inference defaults separate from architecture fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceConfig {
+    #[serde(default = "default_max_sequence_length")]
+    pub max_sequence_length: usize,
+    #[serde(default = "default_max_new_tokens")]
+    pub max_new_tokens: usize,
+    #[serde(default = "default_loop_mode")]
+    pub loop_mode: String,
+    #[serde(default = "default_min_loop_count")]
+    pub min_loops: usize,
+    #[serde(default = "default_inference_max_loops")]
+    pub max_loops: usize,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            max_sequence_length: default_max_sequence_length(),
+            max_new_tokens: default_max_new_tokens(),
+            loop_mode: default_loop_mode(),
+            min_loops: default_min_loop_count(),
+            max_loops: default_inference_max_loops(),
+        }
+    }
+}
+
+impl InferenceConfig {
+    pub fn validate(&self, model: &ModelConfig) -> Result<()> {
+        if self.max_sequence_length == 0 || self.max_new_tokens == 0 {
+            return Err(CognexisError::InvalidConfig(
+                "inference token limits must be positive".to_string(),
+            ));
+        }
+        if self.min_loops == 0 || self.max_loops < self.min_loops {
+            return Err(CognexisError::InvalidConfig(
+                "inference loop bounds must satisfy max_loops >= min_loops >= 1".to_string(),
+            ));
+        }
+        if self.max_loops > model.max_loop_count {
+            return Err(CognexisError::InvalidConfig(format!(
+                "inference.max_loops ({}) exceeds model.max_loop_count ({})",
+                self.max_loops, model.max_loop_count
+            )));
+        }
+        if !matches!(
+            self.loop_mode.as_str(),
+            "fixed" | "adaptive_sequence" | "adaptive_token"
+        ) {
+            return Err(CognexisError::InvalidConfig(format!(
+                "unsupported inference loop_mode {:?}",
+                self.loop_mode
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Evaluation defaults and output destination.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvaluationConfig {
+    #[serde(default)]
+    pub loop_counts: Vec<usize>,
+    pub output_path: Option<String>,
+}
+
+impl EvaluationConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.loop_counts.iter().any(|loops| *loops == 0) {
+            return Err(CognexisError::InvalidConfig(
+                "evaluation.loop_counts must contain only positive depths".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Safety-related serving config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SafetyConfig {
+    #[serde(default = "default_true")]
+    pub input_filter: bool,
+    #[serde(default = "default_true")]
+    pub output_filter: bool,
+    #[serde(default = "default_inference_max_loops")]
+    pub max_user_loops: usize,
+    #[serde(default = "default_true")]
+    pub block_special_token_injection: bool,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            input_filter: true,
+            output_filter: true,
+            max_user_loops: default_inference_max_loops(),
+            block_special_token_injection: true,
+        }
+    }
+}
+
+impl SafetyConfig {
+    pub fn validate(&self, model: &ModelConfig) -> Result<()> {
+        if self.max_user_loops == 0 || self.max_user_loops > model.max_loop_count {
+            return Err(CognexisError::InvalidConfig(format!(
+                "safety.max_user_loops ({}) must be in 1..={}",
+                self.max_user_loops, model.max_loop_count
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Logging config used by reference tooling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default = "default_log_format")]
+    pub format: String,
+    #[serde(default = "default_true")]
+    pub log_loop_stats: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+            log_loop_stats: true,
+        }
+    }
+}
+
+/// Serving configuration used when constructing a model from a checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServeConfig {
     #[serde(default)]
     pub model: ModelConfig,
@@ -220,6 +519,38 @@ impl ServeConfig {
 
 const fn default_min_loop_count() -> usize {
     1
+}
+
+const fn default_schema_version() -> u32 {
+    1
+}
+
+fn default_run_name() -> String {
+    "cognexis".to_string()
+}
+
+const fn default_sequence_length() -> usize {
+    2_048
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+fn default_loop_mode() -> String {
+    "adaptive_sequence".to_string()
+}
+
+const fn default_inference_max_loops() -> usize {
+    8
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "json".to_string()
 }
 
 const fn default_num_kv_heads() -> usize {

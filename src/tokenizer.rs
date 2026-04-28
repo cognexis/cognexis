@@ -5,7 +5,11 @@
 //! reference tokenizer with the same public semantics: explicit special
 //! token handling, truncation policy, and checked decoding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::{CognexisError, Result};
 
@@ -26,7 +30,7 @@ const BYTE_OFFSET: TokenId = 10;
 const BYTE_VOCAB_SIZE: usize = 256;
 
 /// Truncation policy applied after optional BOS/EOS insertion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TruncationPolicy {
     Error,
     Left,
@@ -35,7 +39,7 @@ pub enum TruncationPolicy {
 }
 
 /// Encoding options matching the tokenizer contract in the spec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncodeOptions {
     pub add_bos: bool,
     pub add_eos: bool,
@@ -57,7 +61,7 @@ impl Default for EncodeOptions {
 }
 
 /// Decoding options matching the tokenizer contract in the spec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DecodeOptions {
     pub stop_at_eos: bool,
     pub skip_padding: bool,
@@ -71,6 +75,118 @@ impl Default for DecodeOptions {
             skip_padding: true,
             show_special: false,
         }
+    }
+}
+
+/// Tokenizer algorithm family recorded in checkpoint manifests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TokenizerKind {
+    ReferenceByteFallback,
+    SentencePiece,
+    Bpe,
+}
+
+/// One special-token declaration in a tokenizer manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpecialTokenManifest {
+    pub name: String,
+    pub token: String,
+    pub id: TokenId,
+}
+
+/// Serializable tokenizer manifest used for checkpoint compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenizerManifest {
+    pub schema_version: u32,
+    pub kind: TokenizerKind,
+    pub tokenizer_version: String,
+    pub vocab_size: usize,
+    pub allow_byte_fallback: bool,
+    pub add_bos_default: bool,
+    pub add_eos_default: bool,
+    pub chat_template: Option<String>,
+    pub checksum: Option<String>,
+    pub special_tokens: Vec<SpecialTokenManifest>,
+}
+
+impl TokenizerManifest {
+    /// Build the manifest for the deterministic reference tokenizer.
+    pub fn reference() -> Self {
+        Self {
+            schema_version: 1,
+            kind: TokenizerKind::ReferenceByteFallback,
+            tokenizer_version: "reference-byte-v1".to_string(),
+            vocab_size: BYTE_OFFSET as usize + BYTE_VOCAB_SIZE,
+            allow_byte_fallback: true,
+            add_bos_default: false,
+            add_eos_default: false,
+            chat_template: Some("chatml_v1".to_string()),
+            checksum: Some(reference_tokenizer_checksum()),
+            special_tokens: default_special_token_manifest(),
+        }
+    }
+
+    /// Validate manifest self-consistency independent of tokenizer state.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(CognexisError::Tokenizer(format!(
+                "unsupported tokenizer manifest schema_version {}",
+                self.schema_version
+            )));
+        }
+        if self.vocab_size == 0 {
+            return Err(CognexisError::Tokenizer(
+                "tokenizer vocab_size must be positive".to_string(),
+            ));
+        }
+        if self.tokenizer_version.trim().is_empty() {
+            return Err(CognexisError::Tokenizer(
+                "tokenizer_version must not be empty".to_string(),
+            ));
+        }
+
+        let mut names = HashSet::new();
+        let mut ids = HashSet::new();
+        let mut strings = HashSet::new();
+        for special in &self.special_tokens {
+            if special.name.trim().is_empty() || special.token.is_empty() {
+                return Err(CognexisError::Tokenizer(
+                    "special token names and strings must not be empty".to_string(),
+                ));
+            }
+            if special.id as usize >= self.vocab_size {
+                return Err(CognexisError::Tokenizer(format!(
+                    "special token {} has id {} outside vocab_size {}",
+                    special.name, special.id, self.vocab_size
+                )));
+            }
+            if !names.insert(special.name.as_str())
+                || !ids.insert(special.id)
+                || !strings.insert(special.token.as_str())
+            {
+                return Err(CognexisError::Tokenizer(
+                    "special token names, ids, and strings must be unique".to_string(),
+                ));
+            }
+        }
+
+        for required in ["bos", "eos", "pad", "unk", "eod"] {
+            if !names.contains(required) {
+                return Err(CognexisError::Tokenizer(format!(
+                    "tokenizer manifest missing required special token {required:?}"
+                )));
+            }
+        }
+        if self.chat_template.as_deref() == Some("chatml_v1") {
+            for required in ["system", "user", "assistant", "tool", "end"] {
+                if !names.contains(required) {
+                    return Err(CognexisError::Tokenizer(format!(
+                        "chatml_v1 manifest missing role token {required:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -162,6 +278,11 @@ impl Tokenizer {
         BYTE_OFFSET as usize + BYTE_VOCAB_SIZE
     }
 
+    /// Token ID for the end-of-document marker.
+    pub fn eod_id(&self) -> TokenId {
+        EOD_ID
+    }
+
     /// Token ID for the beginning-of-sequence marker.
     pub fn bos_id(&self) -> TokenId {
         BOS_ID
@@ -180,6 +301,77 @@ impl Tokenizer {
     /// Token ID for the unknown-token marker.
     pub fn unk_id(&self) -> TokenId {
         UNK_ID
+    }
+
+    /// Token ID for a named special token.
+    pub fn special_token_id(&self, token: &str) -> Option<TokenId> {
+        self.token_to_id.get(token).copied()
+    }
+
+    /// Return the checkpoint-compatible manifest for this tokenizer.
+    pub fn manifest(&self) -> TokenizerManifest {
+        TokenizerManifest::reference()
+    }
+
+    /// Validate that a manifest matches this tokenizer.
+    pub fn validate_manifest(&self, manifest: &TokenizerManifest) -> Result<()> {
+        manifest.validate()?;
+        if manifest.vocab_size != self.vocab_size() {
+            return Err(CognexisError::Tokenizer(format!(
+                "manifest vocab_size ({}) does not match tokenizer vocab_size ({})",
+                manifest.vocab_size,
+                self.vocab_size()
+            )));
+        }
+        for special in &manifest.special_tokens {
+            match self.token_to_id.get(&special.token) {
+                Some(id) if *id == special.id => {}
+                Some(id) => {
+                    return Err(CognexisError::Tokenizer(format!(
+                        "manifest token {:?} id {} does not match tokenizer id {}",
+                        special.token, special.id, id
+                    )))
+                }
+                None => {
+                    return Err(CognexisError::Tokenizer(format!(
+                        "manifest token {:?} is not known to tokenizer",
+                        special.token
+                    )))
+                }
+            }
+        }
+        if let Some(checksum) = &manifest.checksum {
+            let expected = reference_tokenizer_checksum();
+            if checksum != &expected {
+                return Err(CognexisError::Tokenizer(format!(
+                    "tokenizer checksum mismatch: expected {expected}, got {checksum}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Save the reference tokenizer manifest as JSON.
+    pub fn save_manifest(&self, path: impl AsRef<Path>) -> Result<()> {
+        let manifest = self.manifest();
+        manifest.validate()?;
+        let encoded = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+            CognexisError::Backend(format!("tokenizer manifest serialization failed: {error}"))
+        })?;
+        fs::write(path.as_ref(), encoded).map_err(|error| {
+            CognexisError::Backend(format!(
+                "failed to write tokenizer manifest {}: {error}",
+                path.as_ref().display()
+            ))
+        })
+    }
+
+    /// Load a tokenizer from a manifest JSON file.
+    pub fn from_manifest(path: impl AsRef<Path>) -> Result<Self> {
+        let manifest = load_tokenizer_manifest(path)?;
+        let tokenizer = Self::new();
+        tokenizer.validate_manifest(&manifest)?;
+        Ok(tokenizer)
     }
 
     /// Tokenize a string into token IDs using permissive legacy defaults.
@@ -306,6 +498,21 @@ impl Tokenizer {
     }
 }
 
+/// Load a tokenizer manifest JSON file.
+pub fn load_tokenizer_manifest(path: impl AsRef<Path>) -> Result<TokenizerManifest> {
+    let contents = fs::read_to_string(path.as_ref()).map_err(|error| {
+        CognexisError::Backend(format!(
+            "failed to read tokenizer manifest {}: {error}",
+            path.as_ref().display()
+        ))
+    })?;
+    let manifest = serde_json::from_str::<TokenizerManifest>(&contents).map_err(|error| {
+        CognexisError::Tokenizer(format!("invalid tokenizer manifest: {error}"))
+    })?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
 impl Default for Tokenizer {
     fn default() -> Self {
         Self::new()
@@ -315,6 +522,47 @@ impl Default for Tokenizer {
 fn byte_from_token_id(id: TokenId) -> Option<u8> {
     let offset = id.checked_sub(BYTE_OFFSET)?;
     (offset < BYTE_VOCAB_SIZE as TokenId).then_some(offset as u8)
+}
+
+fn default_special_token_manifest() -> Vec<SpecialTokenManifest> {
+    [
+        ("bos", "<s>", BOS_ID),
+        ("eos", "</s>", EOS_ID),
+        ("pad", "<pad>", PAD_ID),
+        ("unk", "<unk>", UNK_ID),
+        ("eod", "<eod>", EOD_ID),
+        ("system", "<|system|>", SYSTEM_ID),
+        ("user", "<|user|>", USER_ID),
+        ("assistant", "<|assistant|>", ASSISTANT_ID),
+        ("tool", "<|tool|>", TOOL_ID),
+        ("end", "<|end|>", END_ID),
+    ]
+    .into_iter()
+    .map(|(name, token, id)| SpecialTokenManifest {
+        name: name.to_string(),
+        token: token.to_string(),
+        id,
+    })
+    .collect()
+}
+
+fn reference_tokenizer_checksum() -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for special in default_special_token_manifest() {
+        for byte in special.name.bytes().chain(special.token.bytes()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        for byte in special.id.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    for byte in (BYTE_OFFSET as usize + BYTE_VOCAB_SIZE).to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("fnv64:{hash:016x}")
 }
 
 fn flush_bytes(output: &mut String, byte_buffer: &mut Vec<u8>) {

@@ -7,7 +7,7 @@ use cognexis::checkpoint::{
     load_manifest, load_metadata, save_manifest_atomic, save_metadata_atomic, CheckpointManifest,
     CheckpointMetadata,
 };
-use cognexis::config::ModelConfig;
+use cognexis::config::{CognexisConfig, InferenceConfig, ModelConfig, SafetyConfig};
 use cognexis::curriculum::{
     LoopCurriculumConfig, LoopCurriculumSampler, RampKind, SamplingDistribution,
 };
@@ -37,9 +37,18 @@ use cognexis::scheduler::{
     compute_loops_bounded, HaltReason, LoopAction, LoopScheduling, RuleBasedScheduler,
     SchedulerObservation,
 };
-use cognexis::stability::{estimate_spectral_norm, spectral_normalize};
-use cognexis::tokenizer::{DecodeOptions, EncodeOptions, Tokenizer, TruncationPolicy};
+use cognexis::stability::{
+    clip_global_norm, estimate_spectral_norm, has_non_finite, layer_norm, mean_cosine_similarity,
+    spectral_normalize, summarize_activations, summarize_delta,
+};
+use cognexis::tokenizer::{
+    load_tokenizer_manifest, DecodeOptions, EncodeOptions, Tokenizer, TruncationPolicy,
+};
 use cognexis::tokenwise::{apply_dense_masked_update, TokenLoopState, TokenwiseSchedule};
+use cognexis::value_head::{
+    calibration_report, gain_targets_from_losses, huber_loss, ValueFeatures, ValueHead,
+    ValueHeadConfig, ValuePooling,
+};
 use cognexis::{
     CognexisModel, GenerationRequest, LoopMode, LoopOptions, SamplingOptions, StopReason,
 };
@@ -75,6 +84,37 @@ fn config_validation_enforces_attention_and_loop_invariants() {
     config = tiny_config();
     config.max_loop_count = 0;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn top_level_config_validates_tokenizer_model_compatibility() {
+    let mut config = CognexisConfig::default();
+    config.model.vocab_size = config.tokenizer.vocab_size;
+    config.model.hidden_size = 8;
+    config.model.num_attention_heads = 2;
+    config.model.num_kv_heads = 1;
+    config.model.ff_inner_dim = 16;
+    config.model.max_loop_count = 8;
+    config.inference = Some(InferenceConfig {
+        max_sequence_length: 128,
+        max_new_tokens: 16,
+        loop_mode: "adaptive_sequence".to_string(),
+        min_loops: 1,
+        max_loops: 4,
+    });
+    config.safety = Some(SafetyConfig {
+        max_user_loops: 4,
+        ..SafetyConfig::default()
+    });
+
+    assert!(config.validate().is_ok());
+    let json = config.resolved_json().unwrap();
+    let parsed = serde_json::from_str::<CognexisConfig>(&json).unwrap();
+    assert_eq!(parsed, config);
+
+    let mut bad = config.clone();
+    bad.model.vocab_size += 1;
+    assert!(bad.validate().is_err());
 }
 
 #[test]
@@ -120,6 +160,30 @@ fn tokenizer_round_trips_unicode_and_rejects_untrusted_specials() {
         )
         .unwrap();
     assert_eq!(trusted.len(), 1);
+}
+
+#[test]
+fn tokenizer_manifest_round_trips_and_detects_mismatch() {
+    let tokenizer = Tokenizer::new();
+    let dir = temp_test_dir("tokenizer");
+    fs::create_dir_all(&dir).unwrap();
+    let manifest_path = dir.join("tokenizer.json");
+
+    tokenizer.save_manifest(&manifest_path).unwrap();
+    let manifest = load_tokenizer_manifest(&manifest_path).unwrap();
+    tokenizer.validate_manifest(&manifest).unwrap();
+    let loaded = Tokenizer::from_manifest(&manifest_path).unwrap();
+    assert_eq!(loaded.vocab_size(), tokenizer.vocab_size());
+    assert_eq!(
+        loaded.special_token_id("<|assistant|>"),
+        tokenizer.special_token_id("<|assistant|>")
+    );
+
+    let mut mismatched = manifest.clone();
+    mismatched.checksum = Some("fnv64:0000000000000000".to_string());
+    assert!(tokenizer.validate_manifest(&mismatched).is_err());
+
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -586,6 +650,90 @@ fn safety_context_enforces_special_token_and_budget_policy() {
     assert!(output_decision
         .issues
         .contains(&SafetyIssue::SensitiveInformation));
+}
+
+#[test]
+fn value_head_predicts_masked_gain_and_calibration_metrics() {
+    let mut config = tiny_config();
+    config.hidden_size = 2;
+    let head = ValueHead::with_config(
+        &config,
+        ValueHeadConfig {
+            gain_threshold: 0.05,
+            risk_weight: 0.5,
+            latency_weight: 0.1,
+        },
+    );
+    let hidden = vec![vec![1.0, -1.0], vec![0.0, 0.0], vec![2.0, 0.0]];
+
+    let prediction = head
+        .predict(
+            &hidden,
+            &ValueFeatures {
+                loop_index: 1,
+                max_loops: 4,
+                confidence: Some(0.2),
+                entropy: Some(1.0),
+                hidden_delta: Some(0.5),
+                loop_cost: 2.0,
+                predicted_risk: 0.1,
+                non_pad_mask: Some(vec![true, false, true]),
+                pooling: ValuePooling::SequenceMean,
+            },
+        )
+        .unwrap();
+    assert_eq!(prediction.predicted_gain.len(), 1);
+    assert!(prediction.risk_adjusted_gain[0] < prediction.predicted_gain[0]);
+
+    let token_prediction = head
+        .predict(
+            &hidden,
+            &ValueFeatures {
+                non_pad_mask: Some(vec![true, false, true]),
+                pooling: ValuePooling::TokenWise,
+                max_loops: 4,
+                ..ValueFeatures::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(token_prediction.predicted_gain.len(), 3);
+    assert_eq!(token_prediction.predicted_gain[1], 0.0);
+
+    let targets = gain_targets_from_losses(&[1.0, 0.8, 0.85]);
+    assert!((targets[0] - 0.2).abs() < 1.0e-6);
+    assert!((targets[1] + 0.05).abs() < 1.0e-6);
+    assert!(huber_loss(&[0.2, 0.0], &targets, 0.1).unwrap() >= 0.0);
+    let report = calibration_report(&[0.01, 0.2], &[0.2, 0.0], 0.05).unwrap();
+    assert_eq!(report.false_halt_rate, 0.5);
+    assert_eq!(report.false_continue_rate, 0.5);
+}
+
+#[test]
+fn stability_summaries_detect_non_finite_and_clip_gradients() {
+    let normalized = layer_norm(&[1.0, 2.0, 3.0], 1.0e-5);
+    assert!(normalized.iter().sum::<f32>().abs() < 1.0e-5);
+
+    let previous = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+    let current = vec![vec![2.0, 0.0], vec![0.0, f32::INFINITY]];
+    let summary = summarize_activations(&current);
+    assert_eq!(summary.rows, 2);
+    assert_eq!(summary.cols, 2);
+    assert_eq!(summary.non_finite_count, 1);
+    assert!(has_non_finite(&current));
+
+    let finite_current = vec![vec![2.0, 0.0], vec![0.0, 2.0]];
+    let delta = summarize_delta(&finite_current, &previous).unwrap();
+    assert_eq!(delta.non_finite_count, 0);
+    assert_eq!(
+        mean_cosine_similarity(&finite_current, &previous).unwrap(),
+        1.0
+    );
+
+    let mut gradients = vec![3.0, 4.0];
+    let original_norm = clip_global_norm(&mut gradients, 1.0);
+    assert_eq!(original_norm, 5.0);
+    let clipped_norm = (gradients[0] * gradients[0] + gradients[1] * gradients[1]).sqrt();
+    assert!((clipped_norm - 1.0).abs() < 1.0e-6);
 }
 
 #[test]
