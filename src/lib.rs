@@ -8,6 +8,7 @@
 
 pub mod ablation;
 pub mod attention;
+pub mod checkpoint;
 pub mod coda;
 pub mod config;
 pub mod curriculum;
