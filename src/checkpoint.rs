@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::CognexisConfig;
 use crate::{CognexisError, Result};
 
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -148,6 +149,99 @@ impl CheckpointManifest {
         }
         Ok(())
     }
+}
+
+/// Loaded checkpoint bundle metadata and resolved configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointBundle {
+    pub manifest: CheckpointManifest,
+    pub metadata: CheckpointMetadata,
+    pub resolved_config: CognexisConfig,
+}
+
+/// Save the validated resolved config as `config.resolved.json`.
+pub fn save_resolved_config_atomic(
+    checkpoint_dir: impl AsRef<Path>,
+    config: &CognexisConfig,
+) -> Result<PathBuf> {
+    fs::create_dir_all(checkpoint_dir.as_ref()).map_err(|error| {
+        CognexisError::Backend(format!(
+            "failed to create checkpoint directory {}: {error}",
+            checkpoint_dir.as_ref().display()
+        ))
+    })?;
+    let final_path = checkpoint_dir.as_ref().join("config.resolved.json");
+    let tmp_path = checkpoint_dir.as_ref().join("config.resolved.json.tmp");
+    let encoded = config.resolved_json()?;
+    fs::write(&tmp_path, encoded).map_err(|error| {
+        CognexisError::Backend(format!("failed to write {}: {error}", tmp_path.display()))
+    })?;
+    fs::rename(&tmp_path, &final_path).map_err(|error| {
+        CognexisError::Backend(format!(
+            "failed to move {} to {}: {error}",
+            tmp_path.display(),
+            final_path.display()
+        ))
+    })?;
+    Ok(final_path)
+}
+
+/// Load and validate the resolved checkpoint config.
+pub fn load_resolved_config(checkpoint_dir: impl AsRef<Path>) -> Result<CognexisConfig> {
+    CognexisConfig::load_json(checkpoint_dir.as_ref().join("config.resolved.json"))
+}
+
+/// Save metadata, resolved config, and manifest for a reference checkpoint bundle.
+pub fn save_checkpoint_bundle_atomic(
+    checkpoint_dir: impl AsRef<Path>,
+    metadata: &CheckpointMetadata,
+    config: &CognexisConfig,
+) -> Result<CheckpointManifest> {
+    save_resolved_config_atomic(checkpoint_dir.as_ref(), config)?;
+    save_metadata_atomic(checkpoint_dir.as_ref(), metadata)?;
+    let manifest = CheckpointManifest::reference(metadata.clone());
+    save_manifest_atomic(checkpoint_dir.as_ref(), &manifest)?;
+    Ok(manifest)
+}
+
+/// Load a checkpoint bundle and validate cross-artifact compatibility.
+pub fn load_checkpoint_bundle(checkpoint_dir: impl AsRef<Path>) -> Result<CheckpointBundle> {
+    let manifest = load_manifest(checkpoint_dir.as_ref())?;
+    let metadata = load_metadata(checkpoint_dir.as_ref())?;
+    if manifest.metadata != metadata {
+        return Err(CognexisError::InvalidConfig(
+            "checkpoint manifest metadata does not match metadata.json".to_string(),
+        ));
+    }
+
+    let resolved_config = load_resolved_config(checkpoint_dir.as_ref())?;
+    validate_checkpoint_config_compatibility(&metadata, &resolved_config)?;
+
+    Ok(CheckpointBundle {
+        manifest,
+        metadata,
+        resolved_config,
+    })
+}
+
+/// Validate metadata fields that must agree with the resolved config.
+pub fn validate_checkpoint_config_compatibility(
+    metadata: &CheckpointMetadata,
+    config: &CognexisConfig,
+) -> Result<()> {
+    metadata.validate()?;
+    config.validate()?;
+    if let (Some(expected), Some(actual)) = (
+        metadata.tokenizer_checksum.as_deref(),
+        config.tokenizer.checksum.as_deref(),
+    ) {
+        if expected != actual {
+            return Err(CognexisError::InvalidConfig(format!(
+                "checkpoint tokenizer checksum mismatch: metadata has {expected}, config has {actual}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Save metadata atomically as `metadata.json`.

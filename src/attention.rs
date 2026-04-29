@@ -9,6 +9,45 @@
 use crate::config::ModelConfig;
 use crate::{CognexisError, Result};
 
+/// Explicit attention execution context for masks, positions, and mode.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionContext<'a> {
+    /// Real-key mask where `true` means a key/value position may be attended.
+    pub key_padding_mask: Option<&'a [bool]>,
+    /// Absolute or logical positions for query rows.
+    pub query_position_ids: Option<&'a [u32]>,
+    /// Absolute or logical positions for key rows.
+    pub key_position_ids: Option<&'a [u32]>,
+    /// Packed-document IDs for query rows.
+    pub query_document_ids: Option<&'a [u32]>,
+    /// Packed-document IDs for key rows.
+    pub key_document_ids: Option<&'a [u32]>,
+    /// Active query mask used by token-wise scheduling diagnostics.
+    pub active_query_mask: Option<&'a [bool]>,
+    /// Whether to apply decoder-only causal masking.
+    pub enforce_causal: bool,
+    /// Absolute offset of query row 0 when query is a suffix/decode chunk.
+    pub decode_offset: Option<usize>,
+    /// Whether this is a training call. The reference path has no dropout.
+    pub training: bool,
+}
+
+impl<'a> Default for AttentionContext<'a> {
+    fn default() -> Self {
+        Self {
+            key_padding_mask: None,
+            query_position_ids: None,
+            key_position_ids: None,
+            query_document_ids: None,
+            key_document_ids: None,
+            active_query_mask: None,
+            enforce_causal: true,
+            decode_offset: None,
+            training: false,
+        }
+    }
+}
+
 /// Multi‑head attention layer.
 pub struct MultiHeadAttention {
     /// Number of attention heads.
@@ -46,35 +85,66 @@ impl MultiHeadAttention {
         k: &[Vec<f32>],
         v: &[Vec<f32>],
     ) -> Result<Vec<Vec<f32>>> {
+        self.try_forward_with_context(q, k, v, AttentionContext::default())
+    }
+
+    /// Checked attention path with explicit masks and position context.
+    pub fn try_forward_with_context(
+        &self,
+        q: &[Vec<f32>],
+        k: &[Vec<f32>],
+        v: &[Vec<f32>],
+        context: AttentionContext<'_>,
+    ) -> Result<Vec<Vec<f32>>> {
         self.validate_shapes(q, k, v)?;
+        validate_context(q.len(), k.len(), context)?;
         if q.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut output = vec![vec![0.0; self.hidden_size]; q.len()];
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let decode_offset = k.len().saturating_sub(q.len());
+        let decode_offset = context
+            .decode_offset
+            .unwrap_or_else(|| k.len().saturating_sub(q.len()));
 
         for (query_index, query) in q.iter().enumerate() {
-            let absolute_query_index = decode_offset + query_index;
-            let visible_keys = (absolute_query_index + 1).min(k.len());
+            if context
+                .active_query_mask
+                .map(|mask| !mask[query_index])
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let query_position = query_position(query_index, decode_offset, context);
+            let query_document_id = query_document_id(query_index, decode_offset, k.len(), context);
 
             for head in 0..self.num_heads {
                 let start = head * self.head_dim;
                 let end = start + self.head_dim;
-                let mut scores = Vec::with_capacity(visible_keys);
+                let mut key_indices = Vec::new();
+                let mut scores = Vec::new();
 
-                for key in &k[..visible_keys] {
+                for (key_index, key) in k.iter().enumerate() {
+                    if !key_is_visible(key_index, query_position, query_document_id, context) {
+                        continue;
+                    }
                     let dot = query[start..end]
                         .iter()
                         .zip(&key[start..end])
                         .map(|(a, b)| a * b)
                         .sum::<f32>();
+                    key_indices.push(key_index);
                     scores.push(dot * scale);
+                }
+                if scores.is_empty() {
+                    continue;
                 }
 
                 let weights = stable_softmax(&scores);
-                for (weight, value) in weights.iter().zip(&v[..visible_keys]) {
+                for (weight, key_index) in weights.iter().zip(key_indices) {
+                    let value = &v[key_index];
                     for dim in start..end {
                         output[query_index][dim] += weight * value[dim];
                     }
@@ -131,6 +201,127 @@ impl MultiHeadAttention {
 
         Ok(())
     }
+}
+
+fn validate_context(query_len: usize, key_len: usize, context: AttentionContext<'_>) -> Result<()> {
+    for (name, len, expected) in [
+        (
+            "key_padding_mask",
+            context.key_padding_mask.map(<[bool]>::len),
+            key_len,
+        ),
+        (
+            "query_position_ids",
+            context.query_position_ids.map(<[u32]>::len),
+            query_len,
+        ),
+        (
+            "key_position_ids",
+            context.key_position_ids.map(<[u32]>::len),
+            key_len,
+        ),
+        (
+            "query_document_ids",
+            context.query_document_ids.map(<[u32]>::len),
+            query_len,
+        ),
+        (
+            "key_document_ids",
+            context.key_document_ids.map(<[u32]>::len),
+            key_len,
+        ),
+        (
+            "active_query_mask",
+            context.active_query_mask.map(<[bool]>::len),
+            query_len,
+        ),
+    ] {
+        if let Some(actual) = len {
+            if actual != expected {
+                return Err(CognexisError::ShapeMismatch {
+                    expected: format!("{name} length {expected}"),
+                    actual: format!("{name} length {actual}"),
+                });
+            }
+        }
+    }
+
+    if context
+        .query_position_ids
+        .map(|ids| !is_monotonic(ids))
+        .unwrap_or(false)
+        || context
+            .key_position_ids
+            .map(|ids| !is_monotonic(ids))
+            .unwrap_or(false)
+    {
+        return Err(CognexisError::InvalidConfig(
+            "attention position_ids must be monotonically non-decreasing".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn query_position(query_index: usize, decode_offset: usize, context: AttentionContext<'_>) -> u32 {
+    context
+        .query_position_ids
+        .map(|ids| ids[query_index])
+        .unwrap_or((decode_offset + query_index) as u32)
+}
+
+fn query_document_id(
+    query_index: usize,
+    decode_offset: usize,
+    key_len: usize,
+    context: AttentionContext<'_>,
+) -> Option<u32> {
+    context
+        .query_document_ids
+        .map(|ids| ids[query_index])
+        .or_else(|| {
+            context.key_document_ids.map(|ids| {
+                let key_index = (decode_offset + query_index).min(key_len.saturating_sub(1));
+                ids[key_index]
+            })
+        })
+}
+
+fn key_is_visible(
+    key_index: usize,
+    query_position: u32,
+    query_document_id: Option<u32>,
+    context: AttentionContext<'_>,
+) -> bool {
+    if context
+        .key_padding_mask
+        .map(|mask| !mask[key_index])
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let key_position = context
+        .key_position_ids
+        .map(|ids| ids[key_index])
+        .unwrap_or(key_index as u32);
+    if context.enforce_causal && key_position > query_position {
+        return false;
+    }
+
+    if let (Some(query_document_id), Some(key_document_ids)) =
+        (query_document_id, context.key_document_ids)
+    {
+        if key_document_ids[key_index] != query_document_id {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_monotonic(ids: &[u32]) -> bool {
+    ids.windows(2).all(|pair| pair[0] <= pair[1])
 }
 
 fn stable_softmax(scores: &[f32]) -> Vec<f32> {

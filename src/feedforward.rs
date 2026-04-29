@@ -6,13 +6,14 @@
 //! capacity. See `spec05_feedforward.md` for recommended sizes and
 //! activation choices.
 
-use crate::config::ModelConfig;
+use crate::config::{FeedForwardActivation, ModelConfig};
 use crate::{CognexisError, Result};
 
 /// Feed‑forward network.
 pub struct FeedForwardNetwork {
     pub hidden_size: usize,
     pub inner_size: usize,
+    pub activation: FeedForwardActivation,
 }
 
 impl FeedForwardNetwork {
@@ -21,10 +22,11 @@ impl FeedForwardNetwork {
         Self {
             hidden_size: config.hidden_size,
             inner_size: config.ff_inner_dim,
+            activation: config.ff_activation,
         }
     }
 
-    /// Apply a deterministic SwiGLU-like reference transformation.
+    /// Apply a deterministic reference transformation.
     pub fn forward(&self, x: &[Vec<f32>]) -> Vec<Vec<f32>> {
         self.try_forward(x).unwrap_or_default()
     }
@@ -49,13 +51,26 @@ impl FeedForwardNetwork {
         Ok(x.iter()
             .map(|row| {
                 row.iter()
-                    .map(|value| swish(*value) * *value * scale)
+                    .map(|value| apply_activation(*value, self.activation) * scale)
                     .collect()
             })
             .collect())
     }
 }
 
+fn apply_activation(value: f32, activation: FeedForwardActivation) -> f32 {
+    match activation {
+        FeedForwardActivation::SwiGlu => swish(value) * value,
+        FeedForwardActivation::GeGlu => gelu(value) * value,
+        FeedForwardActivation::Gelu => gelu(value),
+        FeedForwardActivation::Relu => value.max(0.0),
+    }
+}
+
 fn swish(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
+}
+
+fn gelu(value: f32) -> f32 {
+    0.5 * value * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
 }

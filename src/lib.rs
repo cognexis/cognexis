@@ -30,6 +30,7 @@ pub mod scheduler;
 pub mod stability;
 pub mod tokenizer;
 pub mod tokenwise;
+pub mod training;
 pub mod transformer_block;
 pub mod value_head;
 

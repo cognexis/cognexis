@@ -77,6 +77,43 @@ pub fn results_to_jsonl(rows: &[EvaluationResultRow]) -> Result<String> {
     Ok(output)
 }
 
+/// Serialize result rows as CSV with stable column order.
+pub fn results_to_csv(rows: &[EvaluationResultRow]) -> Result<String> {
+    let mut output = String::from(
+        "checkpoint,tokenizer_checksum,dataset,split,loop_mode,loop_count,metric_name,metric_value,latency_ms_mean,flops_mean,hardware,dtype,seed\n",
+    );
+    for row in rows {
+        row.validate()?;
+        output.push_str(&csv_field(&row.checkpoint));
+        output.push(',');
+        output.push_str(&csv_field(row.tokenizer_checksum.as_deref().unwrap_or("")));
+        output.push(',');
+        output.push_str(&csv_field(&row.dataset));
+        output.push(',');
+        output.push_str(&csv_field(&row.split));
+        output.push(',');
+        output.push_str(&csv_field(&row.loop_mode));
+        output.push(',');
+        output.push_str(&row.loop_count.to_string());
+        output.push(',');
+        output.push_str(&csv_field(&row.metric_name));
+        output.push(',');
+        output.push_str(&row.metric_value.to_string());
+        output.push(',');
+        output.push_str(&optional_f64(row.latency_ms_mean));
+        output.push(',');
+        output.push_str(&optional_f64(row.flops_mean));
+        output.push(',');
+        output.push_str(&csv_field(row.hardware.as_deref().unwrap_or("")));
+        output.push(',');
+        output.push_str(&csv_field(row.dtype.as_deref().unwrap_or("")));
+        output.push(',');
+        output.push_str(&row.seed.to_string());
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 /// Parse JSON Lines result rows.
 pub fn results_from_jsonl(jsonl: &str) -> Result<Vec<EvaluationResultRow>> {
     jsonl
@@ -96,12 +133,59 @@ pub fn results_from_jsonl(jsonl: &str) -> Result<Vec<EvaluationResultRow>> {
         .collect()
 }
 
+/// Aggregate row-level evaluation outputs for report headers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationSummary {
+    pub row_count: usize,
+    pub min_loop_count: usize,
+    pub max_loop_count: usize,
+    pub metric_value_mean: f64,
+    pub latency_ms_mean: Option<f64>,
+    pub flops_mean: Option<f64>,
+}
+
+/// Summarize a homogeneous set of evaluation rows.
+pub fn summarize_evaluation_results(rows: &[EvaluationResultRow]) -> Result<EvaluationSummary> {
+    if rows.is_empty() {
+        return Err(CognexisError::InvalidConfig(
+            "cannot summarize empty evaluation results".to_string(),
+        ));
+    }
+    for row in rows {
+        row.validate()?;
+    }
+
+    let metric_value_mean =
+        rows.iter().map(|row| row.metric_value).sum::<f64>() / rows.len() as f64;
+    let min_loop_count = rows.iter().map(|row| row.loop_count).min().unwrap_or(0);
+    let max_loop_count = rows.iter().map(|row| row.loop_count).max().unwrap_or(0);
+    let latency_ms_mean = mean_present(rows.iter().filter_map(|row| row.latency_ms_mean));
+    let flops_mean = mean_present(rows.iter().filter_map(|row| row.flops_mean));
+
+    Ok(EvaluationSummary {
+        row_count: rows.len(),
+        min_loop_count,
+        max_loop_count,
+        metric_value_mean,
+        latency_ms_mean,
+        flops_mean,
+    })
+}
+
 /// Compute perplexity of model outputs against reference tokens.
 pub fn perplexity(logits: &[Vec<f32>], targets: &[u32]) -> f64 {
+    let nll = negative_log_likelihood_for_targets(logits, targets);
+    if !nll.is_finite() {
+        return f64::INFINITY;
+    }
+    nll.exp()
+}
+
+/// Mean next-token negative log-likelihood for target IDs.
+pub fn negative_log_likelihood_for_targets(logits: &[Vec<f32>], targets: &[u32]) -> f64 {
     if logits.is_empty() || targets.is_empty() {
         return f64::INFINITY;
     }
-
     let mut nll = 0.0;
     let mut count = 0usize;
     for (row, &target) in logits.iter().zip(targets) {
@@ -115,8 +199,7 @@ pub fn perplexity(logits: &[Vec<f32>], targets: &[u32]) -> f64 {
     if count == 0 {
         return f64::INFINITY;
     }
-
-    (nll / count as f64).exp()
+    nll / count as f64
 }
 
 /// Compute Depth Efficiency Index (DEI) given performance and compute.
@@ -244,6 +327,55 @@ pub fn accuracy(correct: usize, total: usize) -> f64 {
     correct as f64 / total as f64
 }
 
+/// One multiple-choice scoring example.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultipleChoiceExample {
+    pub choice_scores: Vec<f64>,
+    pub correct_index: usize,
+}
+
+/// Deterministic multiple-choice accuracy using argmax over choice scores.
+pub fn multiple_choice_accuracy(examples: &[MultipleChoiceExample]) -> Result<f64> {
+    if examples.is_empty() {
+        return Ok(0.0);
+    }
+    let mut correct = 0usize;
+    for (example_index, example) in examples.iter().enumerate() {
+        if example.choice_scores.is_empty() {
+            return Err(CognexisError::InvalidConfig(format!(
+                "multiple-choice example {example_index} has no choices"
+            )));
+        }
+        if example.correct_index >= example.choice_scores.len() {
+            return Err(CognexisError::InvalidConfig(format!(
+                "multiple-choice example {example_index} correct_index {} is out of range {}",
+                example.correct_index,
+                example.choice_scores.len()
+            )));
+        }
+        if example.choice_scores.iter().any(|score| !score.is_finite()) {
+            return Err(CognexisError::InvalidConfig(format!(
+                "multiple-choice example {example_index} contains non-finite scores"
+            )));
+        }
+        let predicted = example
+            .choice_scores
+            .iter()
+            .enumerate()
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.partial_cmp(right)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        if predicted == example.correct_index {
+            correct += 1;
+        }
+    }
+    Ok(accuracy(correct, examples.len()))
+}
+
 /// Unbiased pass@k estimator used by code-generation evaluation.
 pub fn pass_at_k(total_samples: usize, correct_samples: usize, k: usize) -> f64 {
     if total_samples == 0 || k == 0 {
@@ -262,6 +394,96 @@ pub fn pass_at_k(total_samples: usize, correct_samples: usize, k: usize) -> f64 
         probability_all_fail *= (incorrect - i) as f64 / (total_samples - i) as f64;
     }
     1.0 - probability_all_fail
+}
+
+/// Corpus-level BLEU with up to 4-gram precision and brevity penalty.
+pub fn bleu_score(predictions: &[&str], references: &[&str]) -> Result<f64> {
+    if predictions.len() != references.len() {
+        return Err(CognexisError::ShapeMismatch {
+            expected: format!("{} references", predictions.len()),
+            actual: format!("{} references", references.len()),
+        });
+    }
+    if predictions.is_empty() {
+        return Ok(0.0);
+    }
+
+    let mut clipped_matches = [0usize; 4];
+    let mut predicted_counts = [0usize; 4];
+    let mut prediction_len = 0usize;
+    let mut reference_len = 0usize;
+    for (prediction, reference) in predictions.iter().zip(references) {
+        let prediction_tokens = tokenize_metric_text(prediction);
+        let reference_tokens = tokenize_metric_text(reference);
+        prediction_len += prediction_tokens.len();
+        reference_len += reference_tokens.len();
+        for n in 1..=4 {
+            let prediction_ngrams = ngram_counts(&prediction_tokens, n);
+            let reference_ngrams = ngram_counts(&reference_tokens, n);
+            predicted_counts[n - 1] += prediction_ngrams
+                .iter()
+                .map(|(_, count)| *count)
+                .sum::<usize>();
+            for (ngram, count) in prediction_ngrams {
+                let reference_count = reference_ngrams
+                    .iter()
+                    .find_map(|(candidate, reference_count)| {
+                        (candidate == &ngram).then_some(*reference_count)
+                    })
+                    .unwrap_or(0);
+                clipped_matches[n - 1] += count.min(reference_count);
+            }
+        }
+    }
+
+    if prediction_len == 0 {
+        return Ok(0.0);
+    }
+    let precisions: Vec<f64> = (0..4)
+        .map(|index| {
+            if predicted_counts[index] == 0 {
+                1.0
+            } else {
+                (clipped_matches[index] as f64 + 1.0) / (predicted_counts[index] as f64 + 1.0)
+            }
+        })
+        .collect();
+    let log_precision_mean = precisions.iter().map(|value| value.ln()).sum::<f64>() / 4.0;
+    let brevity_penalty = if prediction_len > reference_len {
+        1.0
+    } else {
+        (1.0 - reference_len as f64 / prediction_len as f64).exp()
+    };
+    Ok(brevity_penalty * log_precision_mean.exp())
+}
+
+/// Mean ROUGE-L F1 over prediction/reference pairs.
+pub fn rouge_l_f1(predictions: &[&str], references: &[&str]) -> Result<f64> {
+    if predictions.len() != references.len() {
+        return Err(CognexisError::ShapeMismatch {
+            expected: format!("{} references", predictions.len()),
+            actual: format!("{} references", references.len()),
+        });
+    }
+    if predictions.is_empty() {
+        return Ok(0.0);
+    }
+
+    let mut total = 0.0;
+    for (prediction, reference) in predictions.iter().zip(references) {
+        let prediction_tokens = tokenize_metric_text(prediction);
+        let reference_tokens = tokenize_metric_text(reference);
+        if prediction_tokens.is_empty() || reference_tokens.is_empty() {
+            continue;
+        }
+        let lcs = lcs_len(&prediction_tokens, &reference_tokens) as f64;
+        let precision = lcs / prediction_tokens.len() as f64;
+        let recall = lcs / reference_tokens.len() as f64;
+        if precision + recall > 0.0 {
+            total += 2.0 * precision * recall / (precision + recall);
+        }
+    }
+    Ok(total / predictions.len() as f64)
 }
 
 fn negative_log_likelihood(logits: &[f32], target: usize) -> f64 {
@@ -288,4 +510,65 @@ fn sorted_depth_points(points: &[DepthPoint]) -> Option<Vec<DepthPoint>> {
     let mut points = points.to_vec();
     points.sort_by_key(|point| point.loops);
     Some(points)
+}
+
+fn optional_f64(value: Option<f64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn mean_present(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for value in values {
+        total += value;
+        count += 1;
+    }
+    (count > 0).then_some(total / count as f64)
+}
+
+fn tokenize_metric_text(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn ngram_counts(tokens: &[String], n: usize) -> Vec<(Vec<String>, usize)> {
+    if n == 0 || tokens.len() < n {
+        return Vec::new();
+    }
+    let mut counts: Vec<(Vec<String>, usize)> = Vec::new();
+    for window in tokens.windows(n) {
+        let ngram = window.to_vec();
+        if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| candidate == &ngram) {
+            *count += 1;
+        } else {
+            counts.push((ngram, 1));
+        }
+    }
+    counts
+}
+
+fn lcs_len(left: &[String], right: &[String]) -> usize {
+    let mut previous = vec![0usize; right.len() + 1];
+    let mut current = vec![0usize; right.len() + 1];
+    for left_token in left {
+        for (right_index, right_token) in right.iter().enumerate() {
+            current[right_index + 1] = if left_token == right_token {
+                previous[right_index] + 1
+            } else {
+                current[right_index].max(previous[right_index + 1])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+    previous[right.len()]
 }

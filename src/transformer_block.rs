@@ -5,11 +5,20 @@
 //! `spec06_transformer_block.md` for discussion of normalization
 //! strategies (RMSNorm), residual scaling, and block composition.
 
-use crate::attention::MultiHeadAttention;
+use crate::attention::{AttentionContext, MultiHeadAttention};
 use crate::config::ModelConfig;
 use crate::feedforward::FeedForwardNetwork;
 use crate::stability::rms_norm;
 use crate::{CognexisError, Result};
+
+/// Explicit transformer-block execution context.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockContext<'a> {
+    pub layer_id: usize,
+    pub attention: AttentionContext<'a>,
+    /// Token positions that should receive the recurrent update.
+    pub active_token_mask: Option<&'a [bool]>,
+}
 
 /// A single transformer block.
 pub struct TransformerBlock {
@@ -45,17 +54,52 @@ impl TransformerBlock {
 
     /// Checked transformer block path for callers that need structured errors.
     pub fn try_forward(&self, x: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        self.try_forward_with_context(x, BlockContext::default())
+    }
+
+    /// Checked transformer block path with explicit masks and instrumentation context.
+    pub fn try_forward_with_context(
+        &self,
+        x: &[Vec<f32>],
+        context: BlockContext<'_>,
+    ) -> Result<Vec<Vec<f32>>> {
         self.validate_input(x)?;
+        if let Some(active_mask) = context.active_token_mask {
+            if active_mask.len() != x.len() {
+                return Err(CognexisError::ShapeMismatch {
+                    expected: format!("active_token_mask length {}", x.len()),
+                    actual: format!("active_token_mask length {}", active_mask.len()),
+                });
+            }
+        }
 
         let norm_attn = normalize_rows(x, self.norm_epsilon);
-        let attn = self
-            .attention
-            .try_forward(&norm_attn, &norm_attn, &norm_attn)?;
+        let attn = self.attention.try_forward_with_context(
+            &norm_attn,
+            &norm_attn,
+            &norm_attn,
+            context.attention,
+        )?;
         let after_attn = add_scaled(x, &attn, self.attention_residual_scale)?;
 
         let norm_ffn = normalize_rows(&after_attn, self.norm_epsilon);
         let ffn = self.feedforward.try_forward(&norm_ffn)?;
-        add_scaled(&after_attn, &ffn, self.ffn_residual_scale)
+        let output = add_scaled(&after_attn, &ffn, self.ffn_residual_scale)?;
+        Ok(match context.active_token_mask {
+            Some(active_mask) => output
+                .into_iter()
+                .zip(x)
+                .zip(active_mask)
+                .map(|((updated_row, original_row), active)| {
+                    if *active {
+                        updated_row
+                    } else {
+                        original_row.clone()
+                    }
+                })
+                .collect(),
+            None => output,
+        })
     }
 
     fn validate_input(&self, x: &[Vec<f32>]) -> Result<()> {

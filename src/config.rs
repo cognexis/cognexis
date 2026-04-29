@@ -37,12 +37,24 @@ pub struct ModelConfig {
     pub num_kv_heads: usize,
     /// Dimension of each feed‑forward sublayer.
     pub ff_inner_dim: usize,
+    /// Feed-forward activation mode recorded for checkpoint compatibility.
+    #[serde(default)]
+    pub ff_activation: FeedForwardActivation,
     /// Epsilon used by RMS normalization.
     #[serde(default = "default_norm_epsilon")]
     pub norm_epsilon: f32,
     /// Residual scale used for recurrent transformer updates.
     #[serde(default = "default_recurrent_residual_scale")]
     pub recurrent_residual_scale: f32,
+    /// Whether the recurrent wrapper blends candidate updates through a gate.
+    #[serde(default = "default_recurrent_gating")]
+    pub recurrent_gating: bool,
+    /// Input-injection policy anchoring recurrent updates to Prelude output.
+    #[serde(default)]
+    pub recurrent_input_injection: RecurrentInputInjection,
+    /// Scale for recurrent input injection.
+    #[serde(default = "default_recurrent_input_injection_scale")]
+    pub recurrent_input_injection_scale: f32,
     /// Whether the LM head should be tied to embeddings in checkpointed models.
     #[serde(default = "default_tie_embeddings")]
     pub tie_embeddings: bool,
@@ -66,8 +78,12 @@ impl Default for ModelConfig {
             num_attention_heads: 16,
             num_kv_heads: 16,
             ff_inner_dim: 8_192,
+            ff_activation: FeedForwardActivation::default(),
             norm_epsilon: default_norm_epsilon(),
             recurrent_residual_scale: default_recurrent_residual_scale(),
+            recurrent_gating: default_recurrent_gating(),
+            recurrent_input_injection: RecurrentInputInjection::default(),
+            recurrent_input_injection_scale: default_recurrent_input_injection_scale(),
             tie_embeddings: default_tie_embeddings(),
             embedding_scale: default_embedding_scale(),
             tokenizer_path: None,
@@ -141,6 +157,13 @@ impl ModelConfig {
                 "recurrent_residual_scale must be finite and non-negative".to_string(),
             ));
         }
+        if !self.recurrent_input_injection_scale.is_finite()
+            || self.recurrent_input_injection_scale < 0.0
+        {
+            return Err(CognexisError::InvalidConfig(
+                "recurrent_input_injection_scale must be finite and non-negative".to_string(),
+            ));
+        }
         if !self.embedding_scale.is_finite() || self.embedding_scale <= 0.0 {
             return Err(CognexisError::InvalidConfig(
                 "embedding_scale must be finite and positive".to_string(),
@@ -152,6 +175,150 @@ impl ModelConfig {
     /// Attention head dimension derived from the hidden size and query head count.
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+
+    /// Effective sequential transformer-block applications for a loop count.
+    pub fn effective_depth(&self, loops: usize) -> usize {
+        self.num_prelude_layers + loops * self.num_recurrent_blocks + self.num_coda_layers
+    }
+
+    /// Effective depth using the configured maximum loop count.
+    pub fn max_effective_depth(&self) -> usize {
+        self.effective_depth(self.max_loop_count)
+    }
+
+    /// Build one of the named reference Cognexis configurations.
+    pub fn for_variant(variant: CognexisVariant) -> Self {
+        let spec = variant.spec();
+        Self {
+            hidden_size: spec.hidden_size,
+            num_attention_heads: spec.num_attention_heads,
+            num_kv_heads: spec.num_attention_heads / 4,
+            num_prelude_layers: spec.num_prelude_layers,
+            num_recurrent_blocks: spec.num_recurrent_blocks,
+            min_loop_count: 1,
+            max_loop_count: spec.max_loop_count,
+            num_coda_layers: spec.num_coda_layers,
+            ff_inner_dim: spec.hidden_size * 4,
+            recurrent_residual_scale: 1.0 / (spec.max_loop_count as f32).sqrt(),
+            ..Self::default()
+        }
+    }
+
+    /// Build a reference model config by variant name.
+    pub fn from_variant_name(name: &str) -> Result<Self> {
+        Ok(Self::for_variant(CognexisVariant::from_name(name)?))
+    }
+}
+
+/// Named reference model variants from the Cognexis architecture table.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CognexisVariant {
+    Cognexis8B,
+    Cognexis64B,
+    Cognexis256B,
+    Cognexis1_28T,
+}
+
+impl CognexisVariant {
+    pub fn from_name(name: &str) -> Result<Self> {
+        let normalized = name.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+        match normalized.as_str() {
+            "cognexis-8b" | "8b" => Ok(Self::Cognexis8B),
+            "cognexis-64b" | "64b" => Ok(Self::Cognexis64B),
+            "cognexis-256b" | "256b" => Ok(Self::Cognexis256B),
+            "cognexis-1.28t" | "cognexis-1280b" | "1.28t" | "1280b" => Ok(Self::Cognexis1_28T),
+            _ => Err(CognexisError::InvalidConfig(format!(
+                "unknown Cognexis variant {name:?}"
+            ))),
+        }
+    }
+
+    pub fn spec(self) -> CognexisVariantSpec {
+        match self {
+            Self::Cognexis8B => CognexisVariantSpec {
+                name: "Cognexis-8B",
+                hidden_size: 4_096,
+                num_attention_heads: 32,
+                num_prelude_layers: 8,
+                num_recurrent_blocks: 1,
+                num_coda_layers: 8,
+                max_loop_count: 12,
+                parameter_label: "~8B",
+            },
+            Self::Cognexis64B => CognexisVariantSpec {
+                name: "Cognexis-64B",
+                hidden_size: 8_192,
+                num_attention_heads: 64,
+                num_prelude_layers: 10,
+                num_recurrent_blocks: 1,
+                num_coda_layers: 10,
+                max_loop_count: 16,
+                parameter_label: "~64B",
+            },
+            Self::Cognexis256B => CognexisVariantSpec {
+                name: "Cognexis-256B",
+                hidden_size: 12_288,
+                num_attention_heads: 96,
+                num_prelude_layers: 12,
+                num_recurrent_blocks: 1,
+                num_coda_layers: 12,
+                max_loop_count: 20,
+                parameter_label: "~256B",
+            },
+            Self::Cognexis1_28T => CognexisVariantSpec {
+                name: "Cognexis-1.28T",
+                hidden_size: 16_384,
+                num_attention_heads: 128,
+                num_prelude_layers: 16,
+                num_recurrent_blocks: 1,
+                num_coda_layers: 16,
+                max_loop_count: 24,
+                parameter_label: "~1.28T",
+            },
+        }
+    }
+}
+
+/// Immutable model-variant table row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CognexisVariantSpec {
+    pub name: &'static str,
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub num_prelude_layers: usize,
+    pub num_recurrent_blocks: usize,
+    pub num_coda_layers: usize,
+    pub max_loop_count: usize,
+    pub parameter_label: &'static str,
+}
+
+/// Recurrent input injection mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RecurrentInputInjection {
+    None,
+    Residual,
+    GateCondition,
+}
+
+impl Default for RecurrentInputInjection {
+    fn default() -> Self {
+        Self::Residual
+    }
+}
+
+/// Feed-forward activation family.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FeedForwardActivation {
+    SwiGlu,
+    GeGlu,
+    Gelu,
+    Relu,
+}
+
+impl Default for FeedForwardActivation {
+    fn default() -> Self {
+        Self::SwiGlu
     }
 }
 
@@ -196,6 +363,26 @@ impl Default for CognexisConfig {
 }
 
 impl CognexisConfig {
+    /// Build a top-level resolved config for a named reference variant.
+    pub fn for_variant(variant: CognexisVariant) -> Self {
+        let tokenizer = TokenizerManifest::reference();
+        let mut model = ModelConfig::for_variant(variant);
+        model.vocab_size = tokenizer.vocab_size;
+        Self {
+            tokenizer,
+            model,
+            inference: Some(InferenceConfig {
+                max_loops: variant.spec().max_loop_count,
+                ..InferenceConfig::default()
+            }),
+            safety: Some(SafetyConfig {
+                max_user_loops: variant.spec().max_loop_count,
+                ..SafetyConfig::default()
+            }),
+            ..Self::default()
+        }
+    }
+
     /// Load a top-level config from JSON.
     pub fn load_json(path: impl AsRef<Path>) -> Result<Self> {
         let contents = fs::read_to_string(path.as_ref()).map_err(|error| {
@@ -563,6 +750,14 @@ const fn default_norm_epsilon() -> f32 {
 
 const fn default_recurrent_residual_scale() -> f32 {
     0.5
+}
+
+const fn default_recurrent_gating() -> bool {
+    true
+}
+
+const fn default_recurrent_input_injection_scale() -> f32 {
+    0.1
 }
 
 const fn default_tie_embeddings() -> bool {

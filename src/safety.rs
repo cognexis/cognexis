@@ -140,6 +140,15 @@ impl SafetyContext {
         }
         decision_from_flags(&self.output_flags, self.policy_mode)
     }
+
+    /// Combined terminal decision across input and output flags.
+    pub fn final_decision(&self) -> SafetyDecision {
+        let mut flags = self.input_flags.clone();
+        for issue in &self.output_flags.issues {
+            flags.push_unique(*issue);
+        }
+        decision_from_flags(&flags, self.policy_mode)
+    }
 }
 
 /// Action required by safety policy.
@@ -155,6 +164,285 @@ pub enum SafetyAction {
 pub struct SafetyDecision {
     pub action: SafetyAction,
     pub issues: Vec<SafetyIssue>,
+}
+
+/// Summary of recurrent loop usage suitable for structured logs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoopCountsSummary {
+    pub total: usize,
+    pub mean: f64,
+    pub max: usize,
+    pub histogram: Vec<usize>,
+}
+
+impl Default for LoopCountsSummary {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            mean: 0.0,
+            max: 0,
+            histogram: vec![0],
+        }
+    }
+}
+
+/// Structured request telemetry without raw prompt or output content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestTelemetry {
+    pub request_id: String,
+    pub checkpoint_id: Option<String>,
+    pub tokenizer_checksum: Option<String>,
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub loop_mode: String,
+    pub loop_counts: LoopCountsSummary,
+    pub halt_reasons: Vec<String>,
+    pub prefill_latency_ms: Option<f64>,
+    pub decode_latency_ms: Option<f64>,
+    pub safety_action: SafetyAction,
+    pub input_issues: Vec<SafetyIssue>,
+    pub output_issues: Vec<SafetyIssue>,
+    pub stop_reason: Option<String>,
+    pub error: Option<String>,
+    pub cache_memory_bytes: Option<usize>,
+    pub backend: Option<String>,
+}
+
+impl RequestTelemetry {
+    /// Build telemetry from a safety context and non-content request metadata.
+    pub fn from_context(
+        request_id: impl Into<String>,
+        context: &SafetyContext,
+        prompt_tokens: usize,
+        generated_tokens: usize,
+        loop_mode: impl Into<String>,
+        loop_counts: &[usize],
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            checkpoint_id: None,
+            tokenizer_checksum: None,
+            prompt_tokens,
+            generated_tokens,
+            loop_mode: loop_mode.into(),
+            loop_counts: summarize_loop_counts(loop_counts),
+            halt_reasons: Vec::new(),
+            prefill_latency_ms: None,
+            decode_latency_ms: None,
+            safety_action: context.final_decision().action,
+            input_issues: context.input_flags.issues.clone(),
+            output_issues: context.output_flags.issues.clone(),
+            stop_reason: None,
+            error: None,
+            cache_memory_bytes: None,
+            backend: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.request_id.trim().is_empty() || self.loop_mode.trim().is_empty() {
+            return Err(CognexisError::InvalidConfig(
+                "telemetry request_id and loop_mode must not be empty".to_string(),
+            ));
+        }
+        for (name, value) in [
+            ("prefill_latency_ms", self.prefill_latency_ms),
+            ("decode_latency_ms", self.decode_latency_ms),
+        ] {
+            if value
+                .map(|value| !value.is_finite() || value < 0.0)
+                .unwrap_or(false)
+            {
+                return Err(CognexisError::InvalidConfig(format!(
+                    "{name} must be finite and non-negative"
+                )));
+            }
+        }
+        if !self.loop_counts.mean.is_finite() {
+            return Err(CognexisError::InvalidConfig(
+                "loop count mean must be finite".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Serialize as one JSONL record.
+    pub fn to_jsonl(&self) -> Result<String> {
+        self.validate()?;
+        let encoded = serde_json::to_string(self).map_err(|error| {
+            CognexisError::Backend(format!("telemetry serialization failed: {error}"))
+        })?;
+        Ok(format!("{encoded}\n"))
+    }
+}
+
+/// Aggregate counters suitable for dashboards and alerts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SafetyMetrics {
+    pub request_count: u64,
+    pub safety_refusals: u64,
+    pub budget_exhaustions: u64,
+    pub issue_counts: Vec<(SafetyIssue, u64)>,
+}
+
+impl SafetyMetrics {
+    pub fn record(&mut self, telemetry: &RequestTelemetry) {
+        self.request_count += 1;
+        if telemetry.safety_action == SafetyAction::Refuse {
+            self.safety_refusals += 1;
+        }
+
+        let mut issues = telemetry.input_issues.clone();
+        for issue in &telemetry.output_issues {
+            if !issues.contains(issue) {
+                issues.push(*issue);
+            }
+        }
+        if issues.contains(&SafetyIssue::BudgetExceeded) {
+            self.budget_exhaustions += 1;
+        }
+        for issue in issues {
+            increment_issue_count(&mut self.issue_counts, issue);
+        }
+    }
+
+    pub fn issue_count(&self, issue: SafetyIssue) -> u64 {
+        self.issue_counts
+            .iter()
+            .find_map(|(candidate, count)| (*candidate == issue).then_some(*count))
+            .unwrap_or(0)
+    }
+}
+
+/// Safety evaluation result for one loop depth.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SafetyDepthResult {
+    pub loop_count: usize,
+    pub evaluated_cases: usize,
+    pub unsafe_outputs: usize,
+    pub refusals: usize,
+    pub budget_exhaustions: usize,
+}
+
+impl SafetyDepthResult {
+    pub fn validate(&self) -> Result<()> {
+        if self.loop_count == 0 {
+            return Err(CognexisError::InvalidConfig(
+                "safety depth loop_count must be positive".to_string(),
+            ));
+        }
+        if self.unsafe_outputs > self.evaluated_cases
+            || self.refusals > self.evaluated_cases
+            || self.budget_exhaustions > self.evaluated_cases
+        {
+            return Err(CognexisError::InvalidConfig(
+                "safety depth counts must not exceed evaluated_cases".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn unsafe_rate(&self) -> f64 {
+        if self.evaluated_cases == 0 {
+            return 0.0;
+        }
+        self.unsafe_outputs as f64 / self.evaluated_cases as f64
+    }
+}
+
+/// Safety depth policy report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SafetyDepthReport {
+    pub baseline_loop_count: usize,
+    pub baseline_unsafe_rate: f64,
+    pub safe_loop_counts: Vec<usize>,
+    pub restricted_loop_counts: Vec<usize>,
+    pub worst_loop_count: Option<usize>,
+}
+
+/// Identify loop regimes that degrade safety relative to a baseline or absolute cap.
+pub fn evaluate_safety_depth_regimes(
+    results: &[SafetyDepthResult],
+    baseline_loop_count: usize,
+    max_unsafe_rate: f64,
+    degradation_tolerance: f64,
+) -> Result<SafetyDepthReport> {
+    if results.is_empty() {
+        return Err(CognexisError::InvalidConfig(
+            "safety depth evaluation requires at least one result".to_string(),
+        ));
+    }
+    if !max_unsafe_rate.is_finite()
+        || !(0.0..=1.0).contains(&max_unsafe_rate)
+        || !degradation_tolerance.is_finite()
+        || degradation_tolerance < 0.0
+    {
+        return Err(CognexisError::InvalidConfig(
+            "safety depth thresholds must be finite with max_unsafe_rate in [0, 1]".to_string(),
+        ));
+    }
+    for result in results {
+        result.validate()?;
+    }
+    let baseline = results
+        .iter()
+        .find(|result| result.loop_count == baseline_loop_count)
+        .ok_or_else(|| {
+            CognexisError::InvalidConfig(format!(
+                "baseline loop count {baseline_loop_count} is not present in safety results"
+            ))
+        })?;
+    let baseline_unsafe_rate = baseline.unsafe_rate();
+    let mut safe_loop_counts = Vec::new();
+    let mut restricted_loop_counts = Vec::new();
+    let mut worst_loop_count = None;
+    let mut worst_rate = f64::NEG_INFINITY;
+
+    for result in results {
+        let unsafe_rate = result.unsafe_rate();
+        if unsafe_rate > worst_rate {
+            worst_rate = unsafe_rate;
+            worst_loop_count = Some(result.loop_count);
+        }
+        if unsafe_rate > max_unsafe_rate
+            || unsafe_rate > baseline_unsafe_rate + degradation_tolerance
+        {
+            restricted_loop_counts.push(result.loop_count);
+        } else {
+            safe_loop_counts.push(result.loop_count);
+        }
+    }
+    safe_loop_counts.sort_unstable();
+    restricted_loop_counts.sort_unstable();
+
+    Ok(SafetyDepthReport {
+        baseline_loop_count,
+        baseline_unsafe_rate,
+        safe_loop_counts,
+        restricted_loop_counts,
+        worst_loop_count,
+    })
+}
+
+/// Summarize per-token or per-step loop counts.
+pub fn summarize_loop_counts(loop_counts: &[usize]) -> LoopCountsSummary {
+    if loop_counts.is_empty() {
+        return LoopCountsSummary::default();
+    }
+
+    let total = loop_counts.iter().sum::<usize>();
+    let max = loop_counts.iter().copied().max().unwrap_or(0);
+    let mut histogram = vec![0usize; max + 1];
+    for &loops in loop_counts {
+        histogram[loops] += 1;
+    }
+
+    LoopCountsSummary {
+        total,
+        mean: total as f64 / loop_counts.len() as f64,
+        max,
+        histogram,
+    }
 }
 
 /// Lightweight reference safety checks. Production deployments should
@@ -214,4 +502,24 @@ fn contains_reserved_chat_token(text: &str) -> bool {
     ]
     .iter()
     .any(|token| text.contains(token))
+}
+
+fn increment_issue_count(counts: &mut Vec<(SafetyIssue, u64)>, issue: SafetyIssue) {
+    if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| *candidate == issue) {
+        *count += 1;
+    } else {
+        counts.push((issue, 1));
+        counts.sort_by_key(|(issue, _)| issue_order(*issue));
+    }
+}
+
+fn issue_order(issue: SafetyIssue) -> u8 {
+    match issue {
+        SafetyIssue::OffensiveLanguage => 0,
+        SafetyIssue::SensitiveInformation => 1,
+        SafetyIssue::Misinformation => 2,
+        SafetyIssue::SpecialTokenInjection => 3,
+        SafetyIssue::BudgetExceeded => 4,
+        SafetyIssue::Other => 5,
+    }
 }

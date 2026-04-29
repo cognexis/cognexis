@@ -60,6 +60,27 @@ impl Embedding {
             })
             .collect()
     }
+
+    /// Return the unpositioned embedding table row for weight tying checks.
+    pub fn weight_row(&self, token_id: u32) -> Result<Vec<f32>> {
+        if self.hidden_size == 0 || self.vocab_size == 0 {
+            return Err(CognexisError::InvalidConfig(
+                "embedding hidden_size and vocab_size must be positive".to_string(),
+            ));
+        }
+        if token_id as usize >= self.vocab_size {
+            return Err(CognexisError::InvalidTokenId(token_id));
+        }
+
+        Ok((0..self.hidden_size)
+            .map(|dim| reference_embedding_weight_value(token_id, dim))
+            .collect())
+    }
+}
+
+/// Deterministic CPU-reference embedding table value used for tied LM heads.
+pub fn reference_embedding_weight_value(token_id: u32, dim: usize) -> f32 {
+    token_feature(token_id, dim)
 }
 
 fn token_feature(token_id: u32, dim: usize) -> f32 {
