@@ -106,39 +106,10 @@ impl RecurrentCore {
         let mut gate_count = 0usize;
 
         for loop_index in 0..iterations {
-            let previous = output.clone();
-            let mut candidate = previous.clone();
-            for block in &self.blocks {
-                candidate = block.try_forward(&candidate)?;
-            }
-            apply_input_injection(
-                &mut candidate,
-                &h0,
-                self.input_injection,
-                self.input_injection_scale,
-            )?;
-            if self.gating {
-                let (gated, sum, count) = apply_recurrent_gate(
-                    &previous,
-                    &candidate,
-                    &h0,
-                    loop_index,
-                    self.input_injection,
-                    self.norm_epsilon,
-                )?;
-                gate_sum += sum;
-                gate_count += count;
-                output = gated;
-            } else {
-                output = candidate;
-            }
-
-            if has_non_finite(&output) {
-                return Err(CognexisError::Backend(format!(
-                    "non-finite recurrent activation after loop {}",
-                    loop_index + 1
-                )));
-            }
+            let step = self.forward_one_loop_with_stats(&h0, &output, loop_index)?;
+            gate_sum += step.gate_sum;
+            gate_count += step.gate_count;
+            output = step.hidden;
             if options.retain_intermediate_states {
                 intermediate_states.push(output.clone());
             }
@@ -155,6 +126,80 @@ impl RecurrentCore {
             },
         })
     }
+
+    /// Apply exactly one recurrent loop to an existing hidden state.
+    ///
+    /// `anchor` must be the Prelude output for the sequence and
+    /// `current` must be the state produced by the previous recurrent
+    /// loop, or the same Prelude output when `loop_index == 0`.
+    pub fn forward_one_loop(
+        &self,
+        anchor: &[Vec<f32>],
+        current: &[Vec<f32>],
+        loop_index: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.forward_one_loop_with_stats(anchor, current, loop_index)
+            .map(|output| output.hidden)
+    }
+
+    fn forward_one_loop_with_stats(
+        &self,
+        anchor: &[Vec<f32>],
+        current: &[Vec<f32>],
+        loop_index: usize,
+    ) -> Result<SingleLoopOutput> {
+        validate_recurrent_pair(anchor, current)?;
+        if loop_index >= self.max_loops {
+            return Err(CognexisError::InvalidConfig(format!(
+                "loop_index {loop_index} exceeds recurrent max_loops {}",
+                self.max_loops
+            )));
+        }
+
+        let previous = current.to_owned();
+        let mut candidate = previous.clone();
+        for block in &self.blocks {
+            candidate = block.try_forward(&candidate)?;
+        }
+        apply_input_injection(
+            &mut candidate,
+            anchor,
+            self.input_injection,
+            self.input_injection_scale,
+        )?;
+
+        let (hidden, gate_sum, gate_count) = if self.gating {
+            apply_recurrent_gate(
+                &previous,
+                &candidate,
+                anchor,
+                loop_index,
+                self.input_injection,
+                self.norm_epsilon,
+            )?
+        } else {
+            (candidate, 0.0, 0)
+        };
+
+        if has_non_finite(&hidden) {
+            return Err(CognexisError::Backend(format!(
+                "non-finite recurrent activation after loop {}",
+                loop_index + 1
+            )));
+        }
+
+        Ok(SingleLoopOutput {
+            hidden,
+            gate_sum,
+            gate_count,
+        })
+    }
+}
+
+struct SingleLoopOutput {
+    hidden: Vec<Vec<f32>>,
+    gate_sum: f32,
+    gate_count: usize,
 }
 
 fn validate_hidden(x: &[Vec<f32>]) -> Result<()> {
@@ -170,6 +215,26 @@ fn validate_hidden(x: &[Vec<f32>]) -> Result<()> {
             return Err(CognexisError::ShapeMismatch {
                 expected: format!("row width {width}"),
                 actual: format!("row {row_index} width {}", row.len()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_recurrent_pair(anchor: &[Vec<f32>], current: &[Vec<f32>]) -> Result<()> {
+    validate_hidden(anchor)?;
+    validate_hidden(current)?;
+    if anchor.len() != current.len() {
+        return Err(CognexisError::ShapeMismatch {
+            expected: format!("{} anchor rows", anchor.len()),
+            actual: format!("{} current rows", current.len()),
+        });
+    }
+    for (row_index, (anchor_row, current_row)) in anchor.iter().zip(current).enumerate() {
+        if anchor_row.len() != current_row.len() {
+            return Err(CognexisError::ShapeMismatch {
+                expected: format!("row {row_index} width {}", anchor_row.len()),
+                actual: format!("row {row_index} width {}", current_row.len()),
             });
         }
     }

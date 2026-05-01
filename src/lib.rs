@@ -37,6 +37,6 @@ pub mod value_head;
 pub use config::ServeConfig;
 pub use error::{CognexisError, Result};
 pub use model::{
-    CognexisModel, GenerationRequest, GenerationStepOutput, LoopMode, LoopOptions, SamplingOptions,
-    StopReason,
+    CognexisModel, ForwardOutput, GenerationRequest, GenerationStepOutput, LoopMode, LoopOptions,
+    SamplingOptions, StopReason, TextGenerationOutput, TextGenerationRequest,
 };

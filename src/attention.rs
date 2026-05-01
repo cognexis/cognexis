@@ -58,6 +58,12 @@ pub struct MultiHeadAttention {
     pub hidden_size: usize,
     /// Per-head dimension.
     pub head_dim: usize,
+    /// Whether to apply rotary position encoding to Q/K heads.
+    pub rope_enabled: bool,
+    /// RoPE base frequency.
+    pub rope_theta: f32,
+    /// Maximum supported position ID without extrapolation.
+    pub max_position_embeddings: usize,
 }
 
 impl MultiHeadAttention {
@@ -69,6 +75,9 @@ impl MultiHeadAttention {
             num_kv_heads: config.num_kv_heads,
             hidden_size: config.hidden_size,
             head_dim: config.hidden_size / config.num_attention_heads.max(1),
+            rope_enabled: config.rope_enabled,
+            rope_theta: config.rope_theta,
+            max_position_embeddings: config.max_position_embeddings,
         }
     }
 
@@ -118,11 +127,13 @@ impl MultiHeadAttention {
             }
 
             let query_position = query_position(query_index, decode_offset, context);
+            self.validate_position_id(query_position)?;
             let query_document_id = query_document_id(query_index, decode_offset, k.len(), context);
 
             for head in 0..self.num_heads {
                 let start = head * self.head_dim;
                 let end = start + self.head_dim;
+                let query_head = self.head_slice_with_rope(query, start, end, query_position);
                 let mut key_indices = Vec::new();
                 let mut scores = Vec::new();
 
@@ -130,9 +141,15 @@ impl MultiHeadAttention {
                     if !key_is_visible(key_index, query_position, query_document_id, context) {
                         continue;
                     }
-                    let dot = query[start..end]
+                    let key_position = context
+                        .key_position_ids
+                        .map(|ids| ids[key_index])
+                        .unwrap_or(key_index as u32);
+                    self.validate_position_id(key_position)?;
+                    let key_head = self.head_slice_with_rope(key, start, end, key_position);
+                    let dot = query_head
                         .iter()
-                        .zip(&key[start..end])
+                        .zip(&key_head)
                         .map(|(a, b)| a * b)
                         .sum::<f32>();
                     key_indices.push(key_index);
@@ -153,6 +170,42 @@ impl MultiHeadAttention {
         }
 
         Ok(output)
+    }
+
+    fn validate_position_id(&self, position_id: u32) -> Result<()> {
+        if self.rope_enabled && position_id as usize >= self.max_position_embeddings {
+            return Err(CognexisError::InvalidConfig(format!(
+                "position_id {} exceeds max_position_embeddings {}",
+                position_id, self.max_position_embeddings
+            )));
+        }
+        Ok(())
+    }
+
+    fn head_slice_with_rope(
+        &self,
+        row: &[f32],
+        start: usize,
+        end: usize,
+        position_id: u32,
+    ) -> Vec<f32> {
+        let mut head = row[start..end].to_vec();
+        if !self.rope_enabled {
+            return head;
+        }
+
+        let position = position_id as f32;
+        let width = head.len().max(1) as f32;
+        for pair_start in (0..head.len().saturating_sub(1)).step_by(2) {
+            let exponent = pair_start as f32 / width;
+            let angle = position / self.rope_theta.powf(exponent);
+            let (sin, cos) = angle.sin_cos();
+            let even = head[pair_start];
+            let odd = head[pair_start + 1];
+            head[pair_start] = even * cos - odd * sin;
+            head[pair_start + 1] = even * sin + odd * cos;
+        }
+        head
     }
 
     fn validate_shapes(&self, q: &[Vec<f32>], k: &[Vec<f32>], v: &[Vec<f32>]) -> Result<()> {

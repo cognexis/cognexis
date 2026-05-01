@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ModelConfig;
 use crate::{CognexisError, Result};
 
 /// One machine-readable evaluation result row.
@@ -142,6 +143,121 @@ pub struct EvaluationSummary {
     pub metric_value_mean: f64,
     pub latency_ms_mean: Option<f64>,
     pub flops_mean: Option<f64>,
+}
+
+/// Approximate forward-pass compute and memory estimate for reporting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ComputeEstimate {
+    pub sequence_len: usize,
+    pub loop_count: usize,
+    pub effective_depth: usize,
+    pub token_updates: usize,
+    pub prelude_flops: f64,
+    pub recurrent_flops: f64,
+    pub coda_flops: f64,
+    pub lm_head_flops: f64,
+    pub total_flops: f64,
+    pub activation_memory_bytes: usize,
+    pub kv_cache_memory_bytes: usize,
+}
+
+impl ComputeEstimate {
+    pub fn validate(&self) -> Result<()> {
+        if self.sequence_len == 0 {
+            return Err(CognexisError::InvalidConfig(
+                "compute estimate sequence_len must be positive".to_string(),
+            ));
+        }
+        if self.effective_depth == 0 {
+            return Err(CognexisError::InvalidConfig(
+                "compute estimate effective_depth must be positive".to_string(),
+            ));
+        }
+        for (name, value) in [
+            ("prelude_flops", self.prelude_flops),
+            ("recurrent_flops", self.recurrent_flops),
+            ("coda_flops", self.coda_flops),
+            ("lm_head_flops", self.lm_head_flops),
+            ("total_flops", self.total_flops),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(CognexisError::InvalidConfig(format!(
+                    "{name} must be finite and non-negative"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Estimate dense sequence-level forward FLOPs for a fixed loop count.
+pub fn estimate_forward_compute(
+    config: &ModelConfig,
+    sequence_len: usize,
+    loop_count: usize,
+) -> Result<ComputeEstimate> {
+    config.validate()?;
+    if sequence_len == 0 {
+        return Err(CognexisError::InvalidConfig(
+            "sequence_len must be positive for compute estimation".to_string(),
+        ));
+    }
+
+    let bounded_loops = loop_count.clamp(config.min_loop_count, config.max_loop_count);
+    let block_flops = estimate_transformer_block_flops(config, sequence_len);
+    let prelude_flops = block_flops * config.num_prelude_layers as f64;
+    let recurrent_flops = block_flops * config.num_recurrent_blocks as f64 * bounded_loops as f64;
+    let coda_flops = block_flops * config.num_coda_layers as f64;
+    let lm_head_flops =
+        2.0 * sequence_len as f64 * config.hidden_size as f64 * config.vocab_size as f64;
+    let total_flops = prelude_flops + recurrent_flops + coda_flops + lm_head_flops;
+    let estimate = ComputeEstimate {
+        sequence_len,
+        loop_count: bounded_loops,
+        effective_depth: config.effective_depth(bounded_loops),
+        token_updates: sequence_len * bounded_loops,
+        prelude_flops,
+        recurrent_flops,
+        coda_flops,
+        lm_head_flops,
+        total_flops,
+        activation_memory_bytes: sequence_len * config.hidden_size * std::mem::size_of::<f32>(),
+        kv_cache_memory_bytes: estimate_kv_cache_memory_bytes(config, sequence_len),
+    };
+    estimate.validate()?;
+    Ok(estimate)
+}
+
+/// Estimate dense masked token-wise forward cost.
+///
+/// The reference token-wise implementation is dense: it computes every
+/// recurrent pass for every token and then masks halted token updates.
+/// Therefore FLOPs are governed by the maximum token loop count, while
+/// `token_updates` records the smaller number of actually applied token
+/// updates for diagnostics.
+pub fn estimate_tokenwise_forward_compute(
+    config: &ModelConfig,
+    token_loop_counts: &[usize],
+) -> Result<ComputeEstimate> {
+    if token_loop_counts.is_empty() {
+        return Err(CognexisError::InvalidConfig(
+            "token_loop_counts must not be empty".to_string(),
+        ));
+    }
+    if token_loop_counts
+        .iter()
+        .any(|loops| *loops > config.max_loop_count)
+    {
+        return Err(CognexisError::InvalidConfig(format!(
+            "token loop counts must be <= model max_loop_count {}",
+            config.max_loop_count
+        )));
+    }
+    let max_loop_count = token_loop_counts.iter().copied().max().unwrap_or(0);
+    let mut estimate = estimate_forward_compute(config, token_loop_counts.len(), max_loop_count)?;
+    estimate.token_updates = token_loop_counts.iter().sum();
+    estimate.validate()?;
+    Ok(estimate)
 }
 
 /// Summarize a homogeneous set of evaluation rows.
@@ -494,6 +610,42 @@ fn negative_log_likelihood(logits: &[f32], target: usize) -> f64 {
         .sum::<f64>();
     let log_sum_exp = max_logit + sum_exp.ln();
     log_sum_exp - logits[target] as f64
+}
+
+fn estimate_transformer_block_flops(config: &ModelConfig, sequence_len: usize) -> f64 {
+    let seq = sequence_len as f64;
+    let hidden = config.hidden_size as f64;
+    let heads = config.num_attention_heads as f64;
+    let head_dim = config.head_dim() as f64;
+    let kv_hidden = config.num_kv_heads as f64 * head_dim;
+    let ffn = config.ff_inner_dim as f64;
+
+    let q_projection = 2.0 * seq * hidden * hidden;
+    let kv_projection = 4.0 * seq * hidden * kv_hidden;
+    let output_projection = 2.0 * seq * hidden * hidden;
+    let attention_scores = 2.0 * heads * seq * seq * head_dim;
+    let attention_values = 2.0 * heads * seq * seq * head_dim;
+    let ffn_flops = match config.ff_activation {
+        crate::config::FeedForwardActivation::SwiGlu
+        | crate::config::FeedForwardActivation::GeGlu => 6.0 * seq * hidden * ffn,
+        crate::config::FeedForwardActivation::Gelu | crate::config::FeedForwardActivation::Relu => {
+            4.0 * seq * hidden * ffn
+        }
+    };
+
+    q_projection
+        + kv_projection
+        + output_projection
+        + attention_scores
+        + attention_values
+        + ffn_flops
+}
+
+fn estimate_kv_cache_memory_bytes(config: &ModelConfig, sequence_len: usize) -> usize {
+    let kv_width = config.num_kv_heads * config.head_dim();
+    let recurrent_stages = config.max_loop_count * config.num_recurrent_blocks;
+    let stages = config.num_prelude_layers + recurrent_stages + config.num_coda_layers;
+    sequence_len * kv_width * 2 * stages * std::mem::size_of::<f32>()
 }
 
 fn sorted_depth_points(points: &[DepthPoint]) -> Option<Vec<DepthPoint>> {

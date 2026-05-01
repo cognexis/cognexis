@@ -35,6 +35,15 @@ pub struct ModelConfig {
     /// Number of key/value heads for grouped query attention.
     #[serde(default = "default_num_kv_heads")]
     pub num_kv_heads: usize,
+    /// Whether rotary position encoding is applied in attention.
+    #[serde(default = "default_rope_enabled")]
+    pub rope_enabled: bool,
+    /// RoPE base frequency.
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+    /// Maximum supported RoPE position without extrapolation.
+    #[serde(default = "default_max_position_embeddings")]
+    pub max_position_embeddings: usize,
     /// Dimension of each feed‑forward sublayer.
     pub ff_inner_dim: usize,
     /// Feed-forward activation mode recorded for checkpoint compatibility.
@@ -77,6 +86,9 @@ impl Default for ModelConfig {
             num_coda_layers: 6,
             num_attention_heads: 16,
             num_kv_heads: 16,
+            rope_enabled: default_rope_enabled(),
+            rope_theta: default_rope_theta(),
+            max_position_embeddings: default_max_position_embeddings(),
             ff_inner_dim: 8_192,
             ff_activation: FeedForwardActivation::default(),
             norm_epsilon: default_norm_epsilon(),
@@ -125,6 +137,16 @@ impl ModelConfig {
                 "num_attention_heads ({}) must be divisible by num_kv_heads ({})",
                 self.num_attention_heads, self.num_kv_heads
             )));
+        }
+        if self.max_position_embeddings == 0 {
+            return Err(CognexisError::InvalidConfig(
+                "max_position_embeddings must be positive".to_string(),
+            ));
+        }
+        if !self.rope_theta.is_finite() || self.rope_theta <= 1.0 {
+            return Err(CognexisError::InvalidConfig(
+                "rope_theta must be finite and greater than 1".to_string(),
+            ));
         }
         if self.num_recurrent_blocks != 1 {
             return Err(CognexisError::InvalidConfig(
@@ -194,6 +216,7 @@ impl ModelConfig {
             hidden_size: spec.hidden_size,
             num_attention_heads: spec.num_attention_heads,
             num_kv_heads: spec.num_attention_heads / 4,
+            max_position_embeddings: 8_192,
             num_prelude_layers: spec.num_prelude_layers,
             num_recurrent_blocks: spec.num_recurrent_blocks,
             min_loop_count: 1,
@@ -551,9 +574,19 @@ impl InferenceConfig {
                 self.max_loops, model.max_loop_count
             )));
         }
+        let loop_mode = normalize_loop_mode(&self.loop_mode);
         if !matches!(
-            self.loop_mode.as_str(),
-            "fixed" | "adaptive_sequence" | "adaptive_token"
+            loop_mode.as_str(),
+            "fixed"
+                | "adaptive"
+                | "adaptive_sequence"
+                | "rule_based"
+                | "adaptive_value"
+                | "value_head"
+                | "hybrid"
+                | "adaptive_token"
+                | "tokenwise"
+                | "token_wise"
         ) {
             return Err(CognexisError::InvalidConfig(format!(
                 "unsupported inference loop_mode {:?}",
@@ -728,6 +761,13 @@ fn default_loop_mode() -> String {
     "adaptive_sequence".to_string()
 }
 
+fn normalize_loop_mode(loop_mode: &str) -> String {
+    loop_mode
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+}
+
 const fn default_inference_max_loops() -> usize {
     8
 }
@@ -742,6 +782,18 @@ fn default_log_format() -> String {
 
 const fn default_num_kv_heads() -> usize {
     1
+}
+
+const fn default_rope_enabled() -> bool {
+    true
+}
+
+const fn default_max_position_embeddings() -> usize {
+    8_192
+}
+
+const fn default_rope_theta() -> f32 {
+    10_000.0
 }
 
 const fn default_norm_epsilon() -> f32 {

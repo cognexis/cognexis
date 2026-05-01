@@ -123,6 +123,34 @@ impl TokenLoopState {
         }
     }
 
+    /// Halt active tokens according to a per-token decision vector.
+    ///
+    /// This preserves monotonicity: inactive tokens remain inactive and
+    /// no token can be reactivated by a later scheduler observation.
+    pub fn halt_where(&mut self, halt_reasons: &[Option<HaltReason>]) -> Result<()> {
+        if halt_reasons.len() != self.active.len() {
+            return Err(CognexisError::ShapeMismatch {
+                expected: format!("{} halt reasons", self.active.len()),
+                actual: format!("{} halt reasons", halt_reasons.len()),
+            });
+        }
+
+        for (index, reason) in halt_reasons.iter().enumerate() {
+            if self.active[index] {
+                if let Some(reason) = reason {
+                    self.active[index] = false;
+                    self.halt_reasons[index] = Some(*reason);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Maximum loop count reached by any token position.
+    pub fn max_loops(&self) -> usize {
+        self.loops.iter().copied().max().unwrap_or(0)
+    }
+
     /// Histogram where index `i` stores how many tokens ran `i` loops.
     pub fn loop_histogram(&self) -> Vec<usize> {
         let max_loops = self.loops.iter().copied().max().unwrap_or(0);
