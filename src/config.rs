@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use crate::safety::ComputeBudget;
 use crate::tokenizer::TokenizerManifest;
 use crate::{CognexisError, Result};
 
@@ -421,11 +422,43 @@ impl CognexisConfig {
         Ok(config)
     }
 
+    /// Load a top-level config from YAML.
+    pub fn load_yaml(path: impl AsRef<Path>) -> Result<Self> {
+        let contents = fs::read_to_string(path.as_ref()).map_err(|error| {
+            CognexisError::Backend(format!(
+                "failed to read config {}: {error}",
+                path.as_ref().display()
+            ))
+        })?;
+        let config = serde_yaml::from_str::<Self>(&contents).map_err(|error| {
+            CognexisError::InvalidConfig(format!("invalid config YAML: {error}"))
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load a top-level config using the file extension to select JSON or YAML.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        if path_has_yaml_extension(path.as_ref()) {
+            Self::load_yaml(path)
+        } else {
+            Self::load_json(path)
+        }
+    }
+
     /// Serialize the fully resolved config as pretty JSON.
     pub fn resolved_json(&self) -> Result<String> {
         self.validate()?;
         serde_json::to_string_pretty(self).map_err(|error| {
             CognexisError::Backend(format!("config serialization failed: {error}"))
+        })
+    }
+
+    /// Serialize the fully resolved config as YAML for human-authored workflows.
+    pub fn resolved_yaml(&self) -> Result<String> {
+        self.validate()?;
+        serde_yaml::to_string(self).map_err(|error| {
+            CognexisError::Backend(format!("config YAML serialization failed: {error}"))
         })
     }
 
@@ -530,7 +563,7 @@ impl TrainingConfig {
 }
 
 /// Inference defaults separate from architecture fields.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferenceConfig {
     #[serde(default = "default_max_sequence_length")]
     pub max_sequence_length: usize,
@@ -542,6 +575,14 @@ pub struct InferenceConfig {
     pub min_loops: usize,
     #[serde(default = "default_inference_max_loops")]
     pub max_loops: usize,
+    #[serde(default)]
+    pub compute_budget: Option<ComputeBudget>,
+    #[serde(default)]
+    pub scheduler: InferenceSchedulerConfig,
+    #[serde(default)]
+    pub sampling: InferenceSamplingConfig,
+    #[serde(default)]
+    pub cache: InferenceCacheConfig,
 }
 
 impl Default for InferenceConfig {
@@ -552,6 +593,10 @@ impl Default for InferenceConfig {
             loop_mode: default_loop_mode(),
             min_loops: default_min_loop_count(),
             max_loops: default_inference_max_loops(),
+            compute_budget: None,
+            scheduler: InferenceSchedulerConfig::default(),
+            sampling: InferenceSamplingConfig::default(),
+            cache: InferenceCacheConfig::default(),
         }
     }
 }
@@ -592,6 +637,153 @@ impl InferenceConfig {
                 "unsupported inference loop_mode {:?}",
                 self.loop_mode
             )));
+        }
+        if let Some(budget) = &self.compute_budget {
+            budget.validate()?;
+        }
+        self.scheduler.validate()?;
+        self.sampling.validate()?;
+        self.cache.validate()?;
+        Ok(())
+    }
+}
+
+/// Inference scheduler defaults and thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InferenceSchedulerConfig {
+    #[serde(default = "default_scheduler_type")]
+    pub scheduler_type: String,
+    #[serde(default = "default_scheduler_min_delta")]
+    pub min_delta: f32,
+    #[serde(default = "default_scheduler_confidence_threshold")]
+    pub confidence_threshold: f32,
+    #[serde(default = "default_scheduler_predicted_gain_threshold")]
+    pub predicted_gain_threshold: f32,
+}
+
+impl Default for InferenceSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            scheduler_type: default_scheduler_type(),
+            min_delta: default_scheduler_min_delta(),
+            confidence_threshold: default_scheduler_confidence_threshold(),
+            predicted_gain_threshold: default_scheduler_predicted_gain_threshold(),
+        }
+    }
+}
+
+impl InferenceSchedulerConfig {
+    pub fn validate(&self) -> Result<()> {
+        let scheduler_type = normalize_loop_mode(&self.scheduler_type);
+        if !matches!(
+            scheduler_type.as_str(),
+            "fixed" | "rule_based" | "adaptive_sequence" | "value_head" | "hybrid"
+        ) {
+            return Err(CognexisError::InvalidConfig(format!(
+                "unsupported inference scheduler type {:?}",
+                self.scheduler_type
+            )));
+        }
+        if !self.min_delta.is_finite()
+            || self.min_delta < 0.0
+            || !self.confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.confidence_threshold)
+            || !self.predicted_gain_threshold.is_finite()
+            || self.predicted_gain_threshold < 0.0
+        {
+            return Err(CognexisError::InvalidConfig(
+                "scheduler thresholds must be finite, non-negative, and confidence must be in [0, 1]"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Sampling defaults for inference requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InferenceSamplingConfig {
+    #[serde(default = "default_sampling_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_sampling_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub top_k: usize,
+    #[serde(default = "default_sampling_repetition_penalty")]
+    pub repetition_penalty: f32,
+    #[serde(default = "default_eos_token_id")]
+    pub eos_token_id: Option<u32>,
+    #[serde(default)]
+    pub stop_tokens: Vec<u32>,
+}
+
+impl Default for InferenceSamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: default_sampling_temperature(),
+            top_p: default_sampling_top_p(),
+            top_k: 0,
+            repetition_penalty: default_sampling_repetition_penalty(),
+            eos_token_id: default_eos_token_id(),
+            stop_tokens: Vec::new(),
+        }
+    }
+}
+
+impl InferenceSamplingConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.temperature.is_finite()
+            || self.temperature < 0.0
+            || !self.top_p.is_finite()
+            || self.top_p <= 0.0
+            || self.top_p > 1.0
+            || !self.repetition_penalty.is_finite()
+            || self.repetition_penalty <= 0.0
+        {
+            return Err(CognexisError::InvalidConfig(
+                "sampling temperature/top_p/repetition_penalty are out of range".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Cache settings recorded in inference configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceCacheConfig {
+    #[serde(default = "default_cache_type")]
+    pub cache_type: String,
+    #[serde(default = "default_cache_dtype")]
+    pub dtype: String,
+    #[serde(default = "default_cache_max_batch_size")]
+    pub max_batch_size: usize,
+    #[serde(default)]
+    pub max_cache_memory_bytes: Option<usize>,
+}
+
+impl Default for InferenceCacheConfig {
+    fn default() -> Self {
+        Self {
+            cache_type: default_cache_type(),
+            dtype: default_cache_dtype(),
+            max_batch_size: default_cache_max_batch_size(),
+            max_cache_memory_bytes: None,
+        }
+    }
+}
+
+impl InferenceCacheConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.cache_type.trim().is_empty() || self.dtype.trim().is_empty() {
+            return Err(CognexisError::InvalidConfig(
+                "cache type and dtype must not be empty".to_string(),
+            ));
+        }
+        if self.max_batch_size == 0 || self.max_cache_memory_bytes == Some(0) {
+            return Err(CognexisError::InvalidConfig(
+                "cache max_batch_size and max_cache_memory_bytes must be positive when set"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -708,14 +900,31 @@ impl ServeConfig {
             ))
         })?;
 
-        serde_json::from_str::<ServeConfig>(&contents)
-            .or_else(|_| {
-                serde_json::from_str::<ModelConfig>(&contents).map(|model| ServeConfig {
-                    model,
-                    ..ServeConfig::default()
+        let config = if path_has_yaml_extension(path.as_ref()) {
+            serde_yaml::from_str::<ServeConfig>(&contents)
+                .or_else(|_| {
+                    serde_yaml::from_str::<ModelConfig>(&contents).map(|model| ServeConfig {
+                        model,
+                        ..ServeConfig::default()
+                    })
                 })
-            })
-            .map_err(|error| CognexisError::InvalidConfig(format!("invalid serve config: {error}")))
+                .map_err(|error| {
+                    CognexisError::InvalidConfig(format!("invalid serve config YAML: {error}"))
+                })?
+        } else {
+            serde_json::from_str::<ServeConfig>(&contents)
+                .or_else(|_| {
+                    serde_json::from_str::<ModelConfig>(&contents).map(|model| ServeConfig {
+                        model,
+                        ..ServeConfig::default()
+                    })
+                })
+                .map_err(|error| {
+                    CognexisError::InvalidConfig(format!("invalid serve config: {error}"))
+                })?
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Validate serving and architecture limits together.
@@ -731,6 +940,27 @@ impl ServeConfig {
                 return Err(CognexisError::InvalidConfig(
                     "max_user_loops must be positive when set".to_string(),
                 ));
+            }
+            if max_user_loops > self.model.max_loop_count {
+                return Err(CognexisError::InvalidConfig(format!(
+                    "max_user_loops ({max_user_loops}) exceeds model.max_loop_count ({})",
+                    self.model.max_loop_count
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate serving caps against a model resolved from a checkpoint.
+    pub fn validate_for_model(&self, model: &ModelConfig) -> Result<()> {
+        self.validate()?;
+        model.validate()?;
+        if let Some(max_user_loops) = self.max_user_loops {
+            if max_user_loops > model.max_loop_count {
+                return Err(CognexisError::InvalidConfig(format!(
+                    "max_user_loops ({max_user_loops}) exceeds checkpoint model.max_loop_count ({})",
+                    model.max_loop_count
+                )));
             }
         }
         Ok(())
@@ -766,6 +996,59 @@ fn normalize_loop_mode(loop_mode: &str) -> String {
         .trim()
         .to_ascii_lowercase()
         .replace(['-', ' '], "_")
+}
+
+fn path_has_yaml_extension(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase()),
+        Some(extension) if extension == "yaml" || extension == "yml"
+    )
+}
+
+fn default_scheduler_type() -> String {
+    "value_head".to_string()
+}
+
+const fn default_scheduler_min_delta() -> f32 {
+    1.0e-4
+}
+
+const fn default_scheduler_confidence_threshold() -> f32 {
+    0.95
+}
+
+const fn default_scheduler_predicted_gain_threshold() -> f32 {
+    5.0e-4
+}
+
+const fn default_sampling_temperature() -> f32 {
+    1.0
+}
+
+const fn default_sampling_top_p() -> f32 {
+    1.0
+}
+
+const fn default_sampling_repetition_penalty() -> f32 {
+    1.0
+}
+
+const fn default_eos_token_id() -> Option<u32> {
+    Some(1)
+}
+
+fn default_cache_type() -> String {
+    "reference".to_string()
+}
+
+fn default_cache_dtype() -> String {
+    "fp32".to_string()
+}
+
+const fn default_cache_max_batch_size() -> usize {
+    1
 }
 
 const fn default_inference_max_loops() -> usize {

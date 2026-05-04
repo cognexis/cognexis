@@ -26,6 +26,49 @@ pub struct EvaluationResultRow {
     pub hardware: Option<String>,
     pub dtype: Option<String>,
     pub seed: u64,
+    #[serde(default)]
+    pub scheduler_diagnostics: Option<SchedulerEvaluationDiagnostics>,
+}
+
+/// Scheduler observability attached to adaptive evaluation rows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SchedulerEvaluationDiagnostics {
+    pub average_loops_used: Option<f64>,
+    pub loop_count_histogram: Vec<usize>,
+    pub halt_reasons: Vec<String>,
+    pub scheduler_overhead_ms_mean: Option<f64>,
+    pub budget_violation_count: usize,
+}
+
+impl SchedulerEvaluationDiagnostics {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("average_loops_used", self.average_loops_used),
+            (
+                "scheduler_overhead_ms_mean",
+                self.scheduler_overhead_ms_mean,
+            ),
+        ] {
+            if value
+                .map(|value| !value.is_finite() || value < 0.0)
+                .unwrap_or(false)
+            {
+                return Err(CognexisError::InvalidConfig(format!(
+                    "{name} must be finite and non-negative"
+                )));
+            }
+        }
+        if self
+            .halt_reasons
+            .iter()
+            .any(|reason| reason.trim().is_empty())
+        {
+            return Err(CognexisError::InvalidConfig(
+                "scheduler halt reasons must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl EvaluationResultRow {
@@ -60,6 +103,9 @@ impl EvaluationResultRow {
                     .to_string(),
             ));
         }
+        if let Some(diagnostics) = &self.scheduler_diagnostics {
+            diagnostics.validate()?;
+        }
         Ok(())
     }
 }
@@ -81,10 +127,11 @@ pub fn results_to_jsonl(rows: &[EvaluationResultRow]) -> Result<String> {
 /// Serialize result rows as CSV with stable column order.
 pub fn results_to_csv(rows: &[EvaluationResultRow]) -> Result<String> {
     let mut output = String::from(
-        "checkpoint,tokenizer_checksum,dataset,split,loop_mode,loop_count,metric_name,metric_value,latency_ms_mean,flops_mean,hardware,dtype,seed\n",
+        "checkpoint,tokenizer_checksum,dataset,split,loop_mode,loop_count,metric_name,metric_value,latency_ms_mean,flops_mean,hardware,dtype,seed,average_loops_used,loop_count_histogram,halt_reasons,scheduler_overhead_ms_mean,budget_violation_count\n",
     );
     for row in rows {
         row.validate()?;
+        let diagnostics = row.scheduler_diagnostics.as_ref();
         output.push_str(&csv_field(&row.checkpoint));
         output.push(',');
         output.push_str(&csv_field(row.tokenizer_checksum.as_deref().unwrap_or("")));
@@ -110,6 +157,30 @@ pub fn results_to_csv(rows: &[EvaluationResultRow]) -> Result<String> {
         output.push_str(&csv_field(row.dtype.as_deref().unwrap_or("")));
         output.push(',');
         output.push_str(&row.seed.to_string());
+        output.push(',');
+        output.push_str(&optional_f64(
+            diagnostics.and_then(|diagnostics| diagnostics.average_loops_used),
+        ));
+        output.push(',');
+        output.push_str(&csv_field(
+            &diagnostics
+                .map(|diagnostics| join_usize_values(&diagnostics.loop_count_histogram))
+                .unwrap_or_default(),
+        ));
+        output.push(',');
+        output.push_str(&csv_field(
+            &diagnostics
+                .map(|diagnostics| diagnostics.halt_reasons.join(";"))
+                .unwrap_or_default(),
+        ));
+        output.push(',');
+        output.push_str(&optional_f64(
+            diagnostics.and_then(|diagnostics| diagnostics.scheduler_overhead_ms_mean),
+        ));
+        output.push(',');
+        if let Some(diagnostics) = diagnostics {
+            output.push_str(&diagnostics.budget_violation_count.to_string());
+        }
         output.push('\n');
     }
     Ok(output)
@@ -674,6 +745,14 @@ fn csv_field(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn join_usize_values(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 fn mean_present(values: impl Iterator<Item = f64>) -> Option<f64> {

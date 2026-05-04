@@ -9,9 +9,11 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
+use crate::checkpoint::{load_optional_scheduler_state, CheckpointSchedulerState};
 use crate::coda::Coda;
-use crate::config::{InferenceConfig, ModelConfig, ServeConfig};
+use crate::config::{CognexisConfig, InferenceConfig, ModelConfig, ServeConfig};
 use crate::embedding::Embedding;
 use crate::evaluation::estimate_forward_compute;
 use crate::lm_head::LMHead;
@@ -129,6 +131,18 @@ impl Default for SamplingOptions {
 }
 
 impl SamplingOptions {
+    pub fn from_inference_config(config: &InferenceConfig) -> Result<Self> {
+        config.sampling.validate()?;
+        Ok(Self {
+            temperature: config.sampling.temperature,
+            top_p: config.sampling.top_p,
+            top_k: config.sampling.top_k,
+            repetition_penalty: config.sampling.repetition_penalty,
+            eos_token_id: config.sampling.eos_token_id,
+            stop_tokens: config.sampling.stop_tokens.clone(),
+        })
+    }
+
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
         self
@@ -194,6 +208,25 @@ impl TextGenerationRequest {
             loop_safety_policy: None,
         }
     }
+
+    pub fn from_inference_config(
+        prompt: impl Into<String>,
+        config: &InferenceConfig,
+        safety_context: SafetyContext,
+    ) -> Result<Self> {
+        config.scheduler.validate()?;
+        config.cache.validate()?;
+        let mut safety_context = safety_context;
+        merge_inference_budget(&mut safety_context.budget, config);
+        Ok(Self {
+            prompt: prompt.into(),
+            max_new_tokens: config.max_new_tokens,
+            loop_options: LoopOptions::from_inference_config(config)?,
+            sampling: SamplingOptions::from_inference_config(config)?,
+            safety_context,
+            loop_safety_policy: None,
+        })
+    }
 }
 
 /// Final result for safety-aware raw-text generation.
@@ -205,6 +238,7 @@ pub struct TextGenerationOutput {
     pub safety_context: SafetyContext,
     pub estimated_recurrent_flops: Option<u64>,
     pub cache_memory_bytes: Option<usize>,
+    pub wall_time_ms: Option<u64>,
 }
 
 impl TextGenerationOutput {
@@ -244,6 +278,7 @@ impl TextGenerationOutput {
             .map(str::to_string);
         telemetry.estimated_recurrent_flops = self.estimated_recurrent_flops;
         telemetry.cache_memory_bytes = self.cache_memory_bytes;
+        telemetry.wall_time_ms = self.wall_time_ms;
         telemetry
     }
 }
@@ -295,6 +330,70 @@ pub struct CognexisModel {
     act_scheduler: ActScheduler,
 }
 
+fn load_checkpoint_model_config(
+    resolved_config_path: &Path,
+) -> Result<(ModelConfig, Option<InferenceConfig>)> {
+    let contents = fs::read_to_string(resolved_config_path).map_err(|error| {
+        CognexisError::Backend(format!(
+            "failed to read {}: {error}",
+            resolved_config_path.display()
+        ))
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(&contents).map_err(|error| {
+        CognexisError::InvalidConfig(format!(
+            "invalid resolved checkpoint config JSON {}: {error}",
+            resolved_config_path.display()
+        ))
+    })?;
+
+    let is_top_level_config = value
+        .as_object()
+        .map(|object| object.contains_key("model"))
+        .unwrap_or(false);
+
+    if is_top_level_config {
+        let resolved = serde_json::from_value::<CognexisConfig>(value).map_err(|error| {
+            CognexisError::InvalidConfig(format!("invalid resolved Cognexis config: {error}"))
+        })?;
+        resolved.validate()?;
+        Ok((resolved.model, resolved.inference))
+    } else {
+        let config = serde_json::from_value::<ModelConfig>(value).map_err(|error| {
+            CognexisError::InvalidConfig(format!("invalid resolved model config: {error}"))
+        })?;
+        config.validate()?;
+        Ok((config, None))
+    }
+}
+
+fn checkpoint_inference_with_scheduler_state(
+    inference: Option<InferenceConfig>,
+    config: &ModelConfig,
+    scheduler_state: Option<&CheckpointSchedulerState>,
+) -> Result<Option<InferenceConfig>> {
+    let Some(scheduler_state) = scheduler_state else {
+        return Ok(inference);
+    };
+    scheduler_state.validate()?;
+    if let Some(inference) = &inference {
+        if scheduler_state.scheduler != inference.scheduler {
+            return Err(CognexisError::InvalidConfig(
+                "checkpoint scheduler state does not match resolved inference scheduler config"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let mut inference = inference.unwrap_or_else(|| InferenceConfig {
+        min_loops: config.min_loop_count,
+        max_loops: config.max_loop_count,
+        ..InferenceConfig::default()
+    });
+    inference.scheduler = scheduler_state.scheduler.clone();
+    inference.validate(config)?;
+    Ok(Some(inference))
+}
+
 impl CognexisModel {
     /// Build a reference model from a validated architecture config.
     pub fn new(config: ModelConfig) -> Result<Self> {
@@ -313,6 +412,22 @@ impl CognexisModel {
         })
     }
 
+    /// Apply request/runtime scheduler thresholds from inference config.
+    pub fn with_inference_config(mut self, inference: &InferenceConfig) -> Result<Self> {
+        self.apply_inference_config(inference)?;
+        Ok(self)
+    }
+
+    pub fn apply_inference_config(&mut self, inference: &InferenceConfig) -> Result<()> {
+        inference.validate(&self.config)?;
+        self.scheduler.min_delta = inference.scheduler.min_delta;
+        self.scheduler.confidence_threshold = inference.scheduler.confidence_threshold;
+        self.scheduler.predicted_gain_threshold = inference.scheduler.predicted_gain_threshold;
+        self.act_scheduler.config.gain_threshold = inference.scheduler.predicted_gain_threshold;
+        self.act_scheduler.config.validate()?;
+        Ok(())
+    }
+
     /// Build a model from a checkpoint directory and serving config.
     ///
     /// The reference implementation accepts `config.resolved.json` when
@@ -321,23 +436,30 @@ impl CognexisModel {
         checkpoint_dir: impl AsRef<Path>,
         serve_config: &ServeConfig,
     ) -> Result<Self> {
-        serve_config.validate()?;
         let resolved_config_path = checkpoint_dir.as_ref().join("config.resolved.json");
-        let config = if resolved_config_path.exists() {
-            let contents = fs::read_to_string(&resolved_config_path).map_err(|error| {
-                CognexisError::Backend(format!(
-                    "failed to read {}: {error}",
-                    resolved_config_path.display()
-                ))
-            })?;
-            serde_json::from_str::<ModelConfig>(&contents).map_err(|error| {
-                CognexisError::InvalidConfig(format!("invalid resolved model config: {error}"))
-            })?
+        let (config, checkpoint_inference) = if resolved_config_path.exists() {
+            load_checkpoint_model_config(&resolved_config_path)?
         } else {
-            serve_config.model.clone()
+            serve_config.validate()?;
+            (serve_config.model.clone(), None)
         };
+        let checkpoint_scheduler_state = load_optional_scheduler_state(checkpoint_dir.as_ref())?;
+        let checkpoint_inference = checkpoint_inference_with_scheduler_state(
+            checkpoint_inference,
+            &config,
+            checkpoint_scheduler_state.as_ref(),
+        )?;
 
-        Self::new(config)
+        serve_config.validate_for_model(&config)?;
+        let mut model = Self::new(config)?;
+        if let Some(inference) = checkpoint_inference {
+            model.apply_inference_config(&inference)?;
+        }
+        if let Some(scheduler_state) = checkpoint_scheduler_state {
+            model.act_scheduler.config = scheduler_state.act;
+            model.value_head.config = scheduler_state.value_head;
+        }
+        Ok(model)
     }
 
     /// Compute logits for a token sequence at a fixed recurrent depth.
@@ -372,6 +494,15 @@ impl CognexisModel {
         &self,
         request: GenerationRequest,
     ) -> Result<Vec<GenerationStepOutput>> {
+        self.generate_streaming_with_wall_clock(request, None, None)
+    }
+
+    fn generate_streaming_with_wall_clock(
+        &self,
+        request: GenerationRequest,
+        started_at: Option<Instant>,
+        max_wall_time_ms: Option<u64>,
+    ) -> Result<Vec<GenerationStepOutput>> {
         self.validate_generation_request(&request)?;
 
         let mut context = request.input_ids.clone();
@@ -383,6 +514,11 @@ impl CognexisModel {
             .streaming_decoder(TokenDecodeOptions::default());
 
         for _ in 0..request.max_new_tokens {
+            if wall_clock_budget_exceeded(started_at, max_wall_time_ms) {
+                mark_or_push_budget_stop(&mut events);
+                break;
+            }
+
             let forward =
                 self.forward_scheduled(&context, &request.loop_options, remaining_budget)?;
             if forward.loop_count == 0 {
@@ -425,6 +561,11 @@ impl CognexisModel {
             if stop_reason.is_some() {
                 return Ok(events);
             }
+
+            if wall_clock_budget_exceeded(started_at, max_wall_time_ms) {
+                mark_or_push_budget_stop(&mut events);
+                break;
+            }
         }
 
         if let Some(last) = events.last_mut() {
@@ -461,6 +602,7 @@ impl CognexisModel {
                 "max_new_tokens must be positive".to_string(),
             ));
         }
+        let request_started_at = Instant::now();
 
         let TextGenerationRequest {
             prompt,
@@ -564,15 +706,42 @@ impl CognexisModel {
                 StopReason::BudgetExhausted,
                 Some(resource_estimate.recurrent_flops),
                 Some(resource_estimate.cache_memory_bytes),
+                None,
             ));
         }
 
-        let events = self.generate_streaming(GenerationRequest {
-            input_ids,
-            max_new_tokens,
-            loop_options: constrained_loop_options,
-            sampling,
-        })?;
+        let pre_generation_wall_time_ms = elapsed_wall_time_ms(request_started_at);
+        let wall_time_decision =
+            safety_context.check_resource_budget(None, Some(pre_generation_wall_time_ms), None);
+        if should_stop_for_compute_budget(&wall_time_decision) {
+            return Ok(terminal_text_output_with_resources(
+                safety_context,
+                prompt_tokens,
+                Some(SafetyIssue::BudgetExceeded),
+                StopReason::BudgetExhausted,
+                Some(resource_estimate.recurrent_flops),
+                Some(resource_estimate.cache_memory_bytes),
+                Some(pre_generation_wall_time_ms),
+            ));
+        }
+
+        let mut events = self.generate_streaming_with_wall_clock(
+            GenerationRequest {
+                input_ids,
+                max_new_tokens,
+                loop_options: constrained_loop_options,
+                sampling,
+            },
+            Some(request_started_at),
+            safety_context.budget.max_wall_time_ms,
+        )?;
+
+        let wall_time_ms = elapsed_wall_time_ms(request_started_at);
+        let wall_time_decision =
+            safety_context.check_resource_budget(None, Some(wall_time_ms), None);
+        if should_stop_for_compute_budget(&wall_time_decision) {
+            mark_or_push_budget_stop(&mut events);
+        }
 
         let generated_text = events
             .iter()
@@ -609,6 +778,7 @@ impl CognexisModel {
             safety_context,
             estimated_recurrent_flops: Some(resource_estimate.recurrent_flops),
             cache_memory_bytes: Some(resource_estimate.cache_memory_bytes),
+            wall_time_ms: Some(wall_time_ms),
         })
     }
 
@@ -1068,6 +1238,18 @@ fn stop_reason_label(reason: StopReason) -> &'static str {
     }
 }
 
+fn elapsed_wall_time_ms(started_at: Instant) -> u64 {
+    let elapsed = started_at.elapsed().as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX).max(1)
+}
+
+fn wall_clock_budget_exceeded(started_at: Option<Instant>, max_wall_time_ms: Option<u64>) -> bool {
+    match (started_at, max_wall_time_ms) {
+        (Some(started_at), Some(limit)) => elapsed_wall_time_ms(started_at) > limit,
+        _ => false,
+    }
+}
+
 fn mark_or_push_budget_stop(events: &mut Vec<GenerationStepOutput>) {
     if let Some(last) = events.last_mut() {
         last.stop_reason = Some(StopReason::BudgetExhausted);
@@ -1098,6 +1280,7 @@ fn terminal_text_output(
         stop_reason,
         None,
         None,
+        None,
     )
 }
 
@@ -1108,6 +1291,7 @@ fn terminal_text_output_with_resources(
     stop_reason: StopReason,
     estimated_recurrent_flops: Option<u64>,
     cache_memory_bytes: Option<usize>,
+    wall_time_ms: Option<u64>,
 ) -> TextGenerationOutput {
     TextGenerationOutput {
         events: vec![GenerationStepOutput {
@@ -1128,6 +1312,7 @@ fn terminal_text_output_with_resources(
         safety_context,
         estimated_recurrent_flops,
         cache_memory_bytes,
+        wall_time_ms,
     }
 }
 
@@ -1192,6 +1377,53 @@ fn loop_options_with_budget_constraints(
         (None, None) => None,
     };
     loop_options
+}
+
+fn merge_inference_budget(budget: &mut ComputeBudget, config: &InferenceConfig) {
+    budget.max_prompt_tokens = budget.max_prompt_tokens.min(config.max_sequence_length);
+    budget.max_generated_tokens = budget.max_generated_tokens.min(config.max_new_tokens);
+    budget.max_loops_per_token = budget.max_loops_per_token.min(config.max_loops);
+    if let Some(configured) = config.compute_budget {
+        budget.max_prompt_tokens = budget.max_prompt_tokens.min(configured.max_prompt_tokens);
+        budget.max_generated_tokens = budget
+            .max_generated_tokens
+            .min(configured.max_generated_tokens);
+        budget.max_loops_per_token = budget
+            .max_loops_per_token
+            .min(configured.max_loops_per_token);
+        budget.max_total_loops =
+            min_optional_usize(budget.max_total_loops, configured.max_total_loops);
+        budget.max_recurrent_flops =
+            min_optional_u64(budget.max_recurrent_flops, configured.max_recurrent_flops);
+        budget.max_wall_time_ms =
+            min_optional_u64(budget.max_wall_time_ms, configured.max_wall_time_ms);
+        budget.max_cache_memory_bytes = min_optional_usize(
+            budget.max_cache_memory_bytes,
+            configured.max_cache_memory_bytes,
+        );
+    }
+    budget.max_cache_memory_bytes = min_optional_usize(
+        budget.max_cache_memory_bytes,
+        config.cache.max_cache_memory_bytes,
+    );
+}
+
+fn min_optional_usize(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn min_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 fn loop_options_with_safety_policy(

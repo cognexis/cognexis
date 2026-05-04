@@ -8,12 +8,14 @@ use cognexis::ablation::{
 use cognexis::attention::{AttentionContext, MultiHeadAttention};
 use cognexis::checkpoint::{
     load_checkpoint_bundle, load_manifest, load_metadata, load_resolved_config,
-    save_checkpoint_bundle_atomic, save_manifest_atomic, save_metadata_atomic,
-    validate_checkpoint_config_compatibility, CheckpointManifest, CheckpointMetadata,
+    load_scheduler_state, save_checkpoint_bundle_atomic, save_manifest_atomic,
+    save_metadata_atomic, save_scheduler_state_atomic, validate_checkpoint_config_compatibility,
+    validate_checkpoint_scheduler_compatibility, CheckpointManifest, CheckpointMetadata,
+    CheckpointSchedulerState,
 };
 use cognexis::config::{
     CognexisConfig, CognexisVariant, FeedForwardActivation, InferenceConfig, ModelConfig,
-    RecurrentInputInjection, SafetyConfig,
+    RecurrentInputInjection, SafetyConfig, ServeConfig,
 };
 use cognexis::curriculum::{
     LoopCurriculumConfig, LoopCurriculumSampler, RampKind, SamplingDistribution,
@@ -34,7 +36,7 @@ use cognexis::evaluation::{
     multiple_choice_accuracy, negative_log_likelihood_for_targets, overthinking_threshold,
     pass_at_k, perplexity, results_from_jsonl, results_to_csv, results_to_jsonl, rouge_l_f1,
     summarize_evaluation_results, DepthPoint, EvaluationResultRow, MetricDirection,
-    MultipleChoiceExample,
+    MultipleChoiceExample, SchedulerEvaluationDiagnostics,
 };
 use cognexis::feedforward::FeedForwardNetwork;
 use cognexis::instruction_tuning::{
@@ -162,6 +164,7 @@ fn top_level_config_validates_tokenizer_model_compatibility() {
         loop_mode: "adaptive_sequence".to_string(),
         min_loops: 1,
         max_loops: 4,
+        ..InferenceConfig::default()
     });
     config.safety = Some(SafetyConfig {
         max_user_loops: 4,
@@ -172,6 +175,28 @@ fn top_level_config_validates_tokenizer_model_compatibility() {
     let json = config.resolved_json().unwrap();
     let parsed = serde_json::from_str::<CognexisConfig>(&json).unwrap();
     assert_eq!(parsed, config);
+
+    let config_dir = temp_test_dir("config-yaml");
+    fs::create_dir_all(&config_dir).unwrap();
+    let yaml_path = config_dir.join("train.yaml");
+    fs::write(&yaml_path, config.resolved_yaml().unwrap()).unwrap();
+    assert_eq!(CognexisConfig::load_yaml(&yaml_path).unwrap(), config);
+    assert_eq!(CognexisConfig::load(&yaml_path).unwrap(), config);
+
+    let serve_config = ServeConfig {
+        model: config.model.clone(),
+        max_sequence_length: 64,
+        max_new_tokens: 8,
+        max_user_loops: Some(4),
+    };
+    let serve_yaml_path = config_dir.join("serve.yaml");
+    fs::write(
+        &serve_yaml_path,
+        serde_yaml::to_string(&serve_config).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ServeConfig::load(&serve_yaml_path).unwrap(), serve_config);
+    fs::remove_dir_all(&config_dir).unwrap();
 
     let mut bad = config.clone();
     bad.model.vocab_size += 1;
@@ -189,6 +214,57 @@ fn top_level_config_validates_tokenizer_model_compatibility() {
     );
     assert_eq!(loop_options.max_prompt_tokens, Some(128));
     assert_eq!(loop_options.mode.label(), "adaptive_value");
+
+    value_head_inference.sampling.temperature = 0.25;
+    value_head_inference.sampling.top_p = 0.8;
+    value_head_inference.sampling.top_k = 5;
+    value_head_inference.sampling.stop_tokens = vec![9];
+    value_head_inference.compute_budget = Some(ComputeBudget {
+        max_prompt_tokens: 64,
+        max_generated_tokens: 8,
+        max_loops_per_token: 3,
+        max_total_loops: Some(12),
+        max_recurrent_flops: Some(1_000_000),
+        max_wall_time_ms: Some(100),
+        max_cache_memory_bytes: Some(65_536),
+    });
+    value_head_inference.cache.max_cache_memory_bytes = Some(32_768);
+    let text_request = TextGenerationRequest::from_inference_config(
+        "configured prompt",
+        &value_head_inference,
+        SafetyContext::default(),
+    )
+    .unwrap();
+    assert_eq!(text_request.max_new_tokens, 16);
+    assert_eq!(text_request.sampling.temperature, 0.25);
+    assert_eq!(text_request.sampling.top_p, 0.8);
+    assert_eq!(text_request.sampling.top_k, 5);
+    assert_eq!(text_request.sampling.stop_tokens, vec![9]);
+    assert_eq!(text_request.safety_context.budget.max_prompt_tokens, 64);
+    assert_eq!(text_request.safety_context.budget.max_generated_tokens, 8);
+    assert_eq!(text_request.safety_context.budget.max_loops_per_token, 3);
+    assert_eq!(
+        text_request.safety_context.budget.max_cache_memory_bytes,
+        Some(32_768)
+    );
+    value_head_inference.scheduler.min_delta = 0.2;
+    value_head_inference.scheduler.confidence_threshold = 0.7;
+    value_head_inference.scheduler.predicted_gain_threshold = 0.3;
+    let configured_model = CognexisModel::new(config.model.clone())
+        .unwrap()
+        .with_inference_config(&value_head_inference)
+        .unwrap();
+    let configured_forward = configured_model
+        .forward_with_loop_options(&[10, 11], &loop_options)
+        .unwrap();
+    assert_eq!(configured_forward.logits.len(), 2);
+
+    let mut bad_scheduler = value_head_inference.clone();
+    bad_scheduler.scheduler.confidence_threshold = 2.0;
+    assert!(CognexisModel::new(config.model.clone())
+        .unwrap()
+        .with_inference_config(&bad_scheduler)
+        .is_err());
 
     value_head_inference.loop_mode = "token_wise".to_string();
     assert_eq!(
@@ -1043,6 +1119,7 @@ fn text_generation_applies_tokenizer_and_safety_context() {
     assert_eq!(telemetry.stop_reason.as_deref(), Some("max_new_tokens"));
     assert!(telemetry.estimated_recurrent_flops.unwrap() > 0);
     assert!(telemetry.cache_memory_bytes.unwrap() > 0);
+    assert!(telemetry.wall_time_ms.unwrap() > 0);
     let telemetry_jsonl = telemetry.to_jsonl().unwrap();
     assert!(telemetry_jsonl.contains("\"request_id\":\"text-1\""));
     assert!(!telemetry_jsonl.contains(raw_prompt));
@@ -1234,7 +1311,7 @@ fn evaluation_results_jsonl_and_loop_scaling_are_deterministic() {
             tokenizer_checksum: Some("sha256:tok".to_string()),
             dataset: "synthetic".to_string(),
             split: "test".to_string(),
-            loop_mode: "fixed".to_string(),
+            loop_mode: "adaptive_sequence".to_string(),
             loop_count: 1,
             metric_name: "accuracy".to_string(),
             metric_value: 0.5,
@@ -1243,6 +1320,13 @@ fn evaluation_results_jsonl_and_loop_scaling_are_deterministic() {
             hardware: Some("cpu-reference".to_string()),
             dtype: Some("f32".to_string()),
             seed: 7,
+            scheduler_diagnostics: Some(SchedulerEvaluationDiagnostics {
+                average_loops_used: Some(1.5),
+                loop_count_histogram: vec![0, 1, 2],
+                halt_reasons: vec!["confidence".to_string(), "budget".to_string()],
+                scheduler_overhead_ms_mean: Some(0.25),
+                budget_violation_count: 1,
+            }),
         },
         EvaluationResultRow {
             checkpoint: "ckpt-42".to_string(),
@@ -1258,6 +1342,7 @@ fn evaluation_results_jsonl_and_loop_scaling_are_deterministic() {
             hardware: Some("cpu-reference".to_string()),
             dtype: Some("f32".to_string()),
             seed: 7,
+            scheduler_diagnostics: None,
         },
     ];
 
@@ -1266,6 +1351,7 @@ fn evaluation_results_jsonl_and_loop_scaling_are_deterministic() {
     let csv = results_to_csv(&rows).unwrap();
     assert!(csv.starts_with("checkpoint,tokenizer_checksum,dataset"));
     assert!(csv.contains("ckpt-42,sha256:tok,synthetic,test,fixed,2,accuracy,0.7,20,200"));
+    assert!(csv.contains("1.5,0;1;2,confidence;budget,0.25,1"));
     let row_summary = summarize_evaluation_results(&rows).unwrap();
     assert_eq!(row_summary.row_count, 2);
     assert_eq!(row_summary.min_loop_count, 1);
@@ -1404,6 +1490,7 @@ fn reference_trainer_runs_masked_loss_smoke_step() {
             TrainingStepOptions {
                 loops: 2,
                 gradient_clip_norm: Some(1.0),
+                auxiliary_loss_weight: 0.0,
             },
         )
         .unwrap();
@@ -1411,15 +1498,51 @@ fn reference_trainer_runs_masked_loss_smoke_step() {
     assert_eq!(metrics.loops, 2);
     assert_eq!(metrics.active_target_weight, 3.0);
     assert_eq!(metrics.recurrent_applications, 6);
+    assert_eq!(metrics.auxiliary_loss_weight, 0.0);
+    assert_eq!(metrics.depth_losses.len(), 1);
+    assert_eq!(metrics.depth_losses[0].loops, 2);
+    assert!(metrics.value_gain_targets.is_empty());
     assert!(metrics.loss.is_finite());
     assert!(metrics.loss > 0.0);
     assert_eq!(trainer.training_tokens_seen, 3.0);
 
+    let retained_batch = TrainingBatch::from_examples(
+        &examples,
+        0,
+        LoopMetadata {
+            min_loops: 1,
+            max_loops: 2,
+            retain_intermediate_states: true,
+        },
+    )
+    .unwrap();
+    let multi_depth = trainer
+        .train_step(
+            &retained_batch,
+            TrainingStepOptions {
+                loops: 2,
+                gradient_clip_norm: None,
+                auxiliary_loss_weight: 0.25,
+            },
+        )
+        .unwrap();
+    assert_eq!(multi_depth.step, 2);
+    assert_eq!(multi_depth.depth_losses.len(), 2);
+    assert_eq!(multi_depth.depth_losses[0].loops, 1);
+    assert_eq!(multi_depth.depth_losses[1].loops, 2);
+    assert_eq!(multi_depth.value_gain_targets.len(), 1);
+    assert!(
+        (multi_depth.value_gain_targets[0]
+            - (multi_depth.depth_losses[0].loss - multi_depth.depth_losses[1].loss))
+            .abs()
+            < 1.0e-6
+    );
+
     let second = trainer
         .train_step(&batch, TrainingStepOptions::default())
         .unwrap();
-    assert_eq!(second.step, 2);
-    assert_eq!(trainer.training_tokens_seen, 6.0);
+    assert_eq!(second.step, 3);
+    assert_eq!(trainer.training_tokens_seen, 9.0);
 
     assert!(trainer
         .train_step(
@@ -1427,6 +1550,7 @@ fn reference_trainer_runs_masked_loss_smoke_step() {
             TrainingStepOptions {
                 loops: 0,
                 gradient_clip_norm: None,
+                auxiliary_loss_weight: 0.0,
             },
         )
         .is_err());
@@ -1544,6 +1668,29 @@ fn checkpoint_metadata_and_manifest_round_trip() {
     assert_eq!(bundle.metadata, metadata);
     assert_eq!(bundle.manifest, manifest);
     assert_eq!(bundle.resolved_config, config);
+
+    let scheduler_state = load_scheduler_state(&dir).unwrap();
+    assert_eq!(
+        scheduler_state,
+        CheckpointSchedulerState::from_config(&config).unwrap()
+    );
+    assert_eq!(bundle.scheduler_state.as_ref(), Some(&scheduler_state));
+    assert!(validate_checkpoint_scheduler_compatibility(&scheduler_state, &config).is_ok());
+
+    let loaded_model = CognexisModel::from_checkpoint(&dir, &ServeConfig::default()).unwrap();
+    assert_eq!(loaded_model.config, config.model);
+
+    let mut excessive_serve_config = ServeConfig::default();
+    excessive_serve_config.max_user_loops = Some(config.model.max_loop_count + 1);
+    assert!(CognexisModel::from_checkpoint(&dir, &excessive_serve_config).is_err());
+
+    let mut mismatched_scheduler = scheduler_state.clone();
+    mismatched_scheduler.scheduler.min_delta += 0.1;
+    assert!(validate_checkpoint_scheduler_compatibility(&mismatched_scheduler, &config).is_err());
+    save_scheduler_state_atomic(&dir, &mismatched_scheduler).unwrap();
+    assert!(load_checkpoint_bundle(&dir).is_err());
+    assert!(CognexisModel::from_checkpoint(&dir, &ServeConfig::default()).is_err());
+    save_scheduler_state_atomic(&dir, &scheduler_state).unwrap();
 
     let metadata_path = save_metadata_atomic(&dir, &metadata).unwrap();
     assert_eq!(metadata_path.file_name().unwrap(), "metadata.json");
@@ -1833,6 +1980,7 @@ fn ablation_experiments_apply_overrides_and_summarize_results() {
         loop_mode: "adaptive_sequence".to_string(),
         min_loops: 1,
         max_loops: 4,
+        ..InferenceConfig::default()
     });
     baseline.safety = Some(SafetyConfig {
         max_user_loops: 4,

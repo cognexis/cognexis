@@ -5,6 +5,8 @@
 //! DEI‑based scheduling, reinforcement learning, or fine‑grained
 //! selection. See `spec19_value_head.md` for more details.
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::ModelConfig;
 use crate::{CognexisError, Result};
 
@@ -46,7 +48,7 @@ impl Default for ValueFeatures {
 }
 
 /// Tunable value-head output semantics.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ValueHeadConfig {
     pub gain_threshold: f32,
     pub risk_weight: f32,
@@ -60,6 +62,24 @@ impl Default for ValueHeadConfig {
             risk_weight: 1.0,
             latency_weight: 0.0,
         }
+    }
+}
+
+impl ValueHeadConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.gain_threshold.is_finite()
+            || self.gain_threshold < 0.0
+            || !self.risk_weight.is_finite()
+            || self.risk_weight < 0.0
+            || !self.latency_weight.is_finite()
+            || self.latency_weight < 0.0
+        {
+            return Err(CognexisError::InvalidConfig(
+                "value-head gain, risk, and latency weights must be finite and non-negative"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

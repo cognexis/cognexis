@@ -6,6 +6,8 @@
 //! for details on heuristics, DEI‑aware stopping criteria, and token
 //! budget allocation.
 
+use serde::{Deserialize, Serialize};
+
 use crate::value_head::ValuePrediction;
 use crate::{CognexisError, Result};
 
@@ -64,7 +66,7 @@ pub struct ActObservation {
 }
 
 /// ACT policy configuration.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ActSchedulerConfig {
     pub halting_threshold: f32,
     pub gain_threshold: f32,
